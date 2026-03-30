@@ -1,0 +1,52 @@
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    # Database
+    DATABASE_URL: str = "sqlite:///./verivoice.db"
+
+    # Paillier HE key file path
+    PAILLIER_KEY_PATH: str = "./keys/paillier_keys.json"
+
+    # Ed25519 signing key file path
+    ED25519_KEY_PATH: str = "./keys/ed25519_key.bin"
+
+    # ML Models
+    ECAPA_SOURCE: str = "speechbrain/spkrec-ecapa-voxceleb"
+    WHISPER_MODEL: str = "large-v3"
+
+    # Audio preprocessing
+    SAMPLE_RATE: int = 16000
+    EMBEDDING_DIM: int = 192
+    GSM_ENFORCE: bool = False
+    VAD_TOP_DB: int = 25
+    PRE_EMPHASIS_COEFF: float = 0.97
+    PEAK_NORM_TARGET: float = 0.95
+    NOISE_RMS_THRESHOLD: float = 0.05
+    MIN_AUDIO_DURATION: float = 1.0
+
+    # Encryption
+    PAILLIER_BITS: int = 2048
+
+    # Matching
+    MATCH_THRESHOLD: float = 0.45
+    TRANSCRIPT_MATCH_THRESHOLD: float = 0.75
+
+    # Enrollment
+    ENROLLMENT_PHRASES: int = 5
+
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Twilio
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_PHONE_NUMBER: str = ""
+
+    # Streamlit (used by frontend, but matched in .env)
+    BACKEND_URL: str = "http://localhost:8000"
+
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+
+settings = Settings()

@@ -1,0 +1,39 @@
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+
+# Database
+*.db
+
+# Keys (sensitive)
+keys/
+
+# ML model weights (downloaded at runtime)
+speechbrain_spkrec-ecapa-voxceleb/
+pretrained_ecapa/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+temp/
+
+# Notes/Docs
+CLAUDE.md
+TODO.md
