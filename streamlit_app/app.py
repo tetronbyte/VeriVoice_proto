@@ -294,10 +294,10 @@ elif page == "Service Access":
                             st.rerun()
                         else:
                             try:
-                            detail = resp.json().get("detail", resp.text)
-                        except Exception:
-                            detail = resp.text
-                        st.error(f"Error {resp.status_code}: {detail}")
+                                detail = resp.json().get("detail", resp.text)
+                            except Exception:
+                                detail = resp.text
+                            st.error(f"Error {resp.status_code}: {detail}")
                     except httpx.ConnectError:
                         st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
