@@ -145,16 +145,22 @@ elif page == "Consent":
     st.markdown("Record verbal consent and generate a **cryptographically signed token**.")
 
     citizen_id = st.text_input("Citizen ID (UUID)", key="consent_citizen_id")
+    lang = st.selectbox("Language", ["en", "sw"], index=0, key="consent_lang")
     ministry_code = st.text_input("Ministry Code", value="MOH", key="consent_ministry")
     data_scope = st.text_input("Data Scope", value="health_records", key="consent_scope")
 
     st.markdown("---")
     st.subheader("Consent Text")
-    consent_text = f"I consent to share my {data_scope} with {ministry_code}."
+    if lang == "sw":
+        consent_text = f"Ninakubali kushiriki {data_scope} yangu na {ministry_code}."
+        audio_prompt = "Pakia sauti yako ya idhini (mfano, sema 'Ndiyo, ninakubali')"
+    else:
+        consent_text = f"I consent to share my {data_scope} with {ministry_code}."
+        audio_prompt = "Upload your consent audio (e.g., say 'Yes, I agree')"
     st.info(consent_text)
 
     consent_audio = st.file_uploader(
-        "Upload your consent audio (e.g., say 'Yes, I agree')",
+        audio_prompt,
         type=["wav", "mp3", "ogg"],
         key="consent_audio",
     )
@@ -186,42 +192,138 @@ elif page == "Consent":
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SERVICE ACCESS
+# SERVICE ACCESS — Health Insurance Form (3 questions + TTS read-back)
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "Service Access":
     st.header("Service Access — Health Insurance Form")
-    st.markdown("Voice-driven Q&A with a simulated form.")
+    st.markdown("Voice-driven Q&A: answer **3 questions** via speech, then hear a TTS read-back for confirmation.")
 
     citizen_id = st.text_input("Citizen ID (UUID)", key="svc_citizen_id")
     consent_token_id = st.text_input("Consent Token ID", key="svc_token_id")
+    lang = st.selectbox("Language", ["en", "sw"], index=0, key="svc_lang")
 
-    answer_audio = st.file_uploader(
-        "Upload your spoken answer",
-        type=["wav", "mp3", "ogg"],
-        key="svc_audio",
-    )
+    # ── Form questions ───────────────────────────────────────────────────
+    questions = {
+        "en": [
+            "Please say your full name.",
+            "How many dependants would you like to register?",
+            "Which hospital or health centre would you like as your primary facility?",
+        ],
+        "sw": [
+            "Tafadhali sema jina lako kamili.",
+            "Ungependa kusajili wategemezi wangapi?",
+            "Ungependa hospitali au kituo kipi cha afya kuwa kituo chako kikuu?",
+        ],
+    }
+    field_labels = {
+        "en": ["Full Name", "Dependants", "Primary Facility"],
+        "sw": ["Jina Kamili", "Wategemezi", "Kituo Kikuu"],
+    }
 
-    if st.button("Submit Answer"):
-        if not citizen_id or not consent_token_id:
-            st.error("Citizen ID and Consent Token ID are required.")
-        elif answer_audio is None:
-            st.error("Upload your spoken answer.")
-        else:
+    # Initialise session state for collected answers
+    if "svc_answers" not in st.session_state:
+        st.session_state["svc_answers"] = {}
+    if "svc_step" not in st.session_state:
+        st.session_state["svc_step"] = 0
+
+    q_list = questions.get(lang, questions["en"])
+    labels = field_labels.get(lang, field_labels["en"])
+    step = st.session_state["svc_step"]
+
+    st.markdown("---")
+
+    # ── Show already-collected answers ───────────────────────────────────
+    if st.session_state["svc_answers"]:
+        st.subheader("Collected Answers" if lang == "en" else "Majibu Yaliyokusanywa")
+        for idx, key in enumerate(["full_name", "dependants", "primary_facility"]):
+            if key in st.session_state["svc_answers"]:
+                st.success(f"**{labels[idx]}:** {st.session_state['svc_answers'][key]}")
+
+    # ── Current question or summary ──────────────────────────────────────
+    if step < len(q_list):
+        st.subheader(f"Question {step + 1} of {len(q_list)}" if lang == "en" else f"Swali {step + 1} kati ya {len(q_list)}")
+        st.info(q_list[step])
+
+        answer_audio = st.file_uploader(
+            "Upload your spoken answer" if lang == "en" else "Pakia jibu lako la sauti",
+            type=["wav", "mp3", "ogg"],
+            key=f"svc_audio_{step}",
+        )
+
+        if st.button("Submit Answer" if lang == "en" else "Wasilisha Jibu"):
+            if not citizen_id or not consent_token_id:
+                st.error("Citizen ID and Consent Token ID are required." if lang == "en" else "Kitambulisho cha Raia na Tokeni ya Idhini vinahitajika.")
+            elif answer_audio is None:
+                st.error("Upload your spoken answer." if lang == "en" else "Pakia jibu lako la sauti.")
+            else:
+                data = {
+                    "citizen_id": citizen_id,
+                    "consent_token_id": consent_token_id,
+                    "question_index": str(step),
+                }
+                files = [("audio_file", ("answer.wav", answer_audio.getvalue(), "audio/wav"))]
+                with st.spinner("Processing..." if lang == "en" else "Inachakatwa..."):
+                    try:
+                        resp = httpx.post(f"{API}/service-access", data=data, files=files, timeout=120.0)
+                        if resp.status_code == 200:
+                            body = resp.json()
+                            field_key = body["field_key"]
+                            answer = body["transcribed_answer"]
+                            raw = body.get("raw_transcription", answer)
+
+                            st.session_state["svc_answers"][field_key] = answer
+
+                            # Show transcription result
+                            st.success(f"**{labels[step]}:** {answer}")
+                            if raw != answer:
+                                st.caption(f"Raw transcription: {raw}")
+
+                            st.session_state["svc_step"] = step + 1
+                            st.rerun()
+                        else:
+                            st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
+                    except httpx.ConnectError:
+                        st.error(f"Cannot connect to backend at {BACKEND_URL}.")
+
+    else:
+        # ── All 3 questions answered — show summary + TTS read-back ──────
+        answers = st.session_state["svc_answers"]
+        st.subheader("Form Summary" if lang == "en" else "Muhtasari wa Fomu")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric(labels[0], answers.get("full_name", "—"))
+        col2.metric(labels[1], answers.get("dependants", "—"))
+        col3.metric(labels[2], answers.get("primary_facility", "—"))
+
+        # Request TTS read-back from backend
+        if st.button("Generate Read-back" if lang == "en" else "Tengeneza Muhtasari wa Sauti"):
             data = {
                 "citizen_id": citizen_id,
                 "consent_token_id": consent_token_id,
+                "full_name": answers.get("full_name", ""),
+                "dependants": answers.get("dependants", ""),
+                "primary_facility": answers.get("primary_facility", ""),
+                "language": lang,
             }
-            files = [("audio_file", ("answer.wav", answer_audio.getvalue(), "audio/wav"))]
-            with st.spinner("Processing answer..."):
+            with st.spinner("Generating summary audio..." if lang == "en" else "Inatengeneza sauti..."):
                 try:
-                    resp = httpx.post(f"{API}/service-access", data=data, files=files, timeout=120.0)
+                    resp = httpx.post(f"{API}/service-access/summary", data=data, timeout=60.0)
                     if resp.status_code == 200:
                         body = resp.json()
-                        st.success("Answer recorded!")
-                        st.markdown(f"**Question:** {body.get('question', 'N/A')}")
-                        st.markdown(f"**Your Answer:** {body.get('transcribed_answer', 'N/A')}")
-                        st.json(body)
+                        st.info(body["summary_text"])
+                        audio_path = body.get("audio_url")
+                        if audio_path:
+                            try:
+                                st.audio(audio_path)
+                            except Exception:
+                                st.caption(f"Audio saved at: {audio_path}")
                     else:
                         st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
                 except httpx.ConnectError:
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
+
+        # Reset button to start over
+        if st.button("Start New Form" if lang == "en" else "Anza Fomu Mpya"):
+            st.session_state["svc_answers"] = {}
+            st.session_state["svc_step"] = 0
+            st.rerun()

@@ -320,43 +320,82 @@ async def consent_callback(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SERVICE ACCESS
+# SERVICE ACCESS — Health Insurance Form (3 questions + TTS read-back)
 # ═════════════════════════════════════════════════════════════════════════════
+
+_SERVICE_QUESTIONS = {
+    "en": [
+        "Please say your full name.",
+        "How many dependants would you like to register?",
+        "Which hospital or health centre would you like as your primary facility?",
+    ],
+    "sw": [
+        "Tafadhali sema jina lako kamili.",
+        "Ungependa kusajili wategemezi wangapi?",
+        "Ungependa hospitali au kituo kipi cha afya kuwa kituo chako kikuu?",
+    ],
+}
+
+_SERVICE_FIELD_KEYS = ["full_name", "dependants", "primary_facility"]
+
 
 @router.post("/voice/service")
 async def service_prompt(
     request: Request,
     lang: str = Query(default="en"),
     question_index: int = Query(default=0),
+    full_name: str = Query(default=""),
+    dependants: str = Query(default=""),
+    primary_facility: str = Query(default=""),
 ):
     """Play a health insurance form question and record the answer."""
     await _validate_twilio_request(request)
     response = VoiceResponse()
 
-    questions = {
-        "en": [
-            "What is your full name?",
-            "What is your date of birth?",
-            "What is your current address?",
-        ],
-        "sw": [
-            "Jina lako kamili ni nani?",
-            "Tarehe yako ya kuzaliwa ni lini?",
-            "Anwani yako ya sasa ni nini?",
-        ],
-    }
-
-    q_list = questions.get(lang, questions["en"])
+    q_list = _SERVICE_QUESTIONS.get(lang, _SERVICE_QUESTIONS["en"])
 
     if question_index >= len(q_list):
-        response.say("All questions answered. Thank you." if lang == "en" else "Maswali yote yamejibiwa. Asante.", voice="alice")
-        response.hangup()
+        # All 3 questions answered — play TTS read-back summary
+        if lang == "sw":
+            summary = (
+                f"Asante. Nimekusanya: jina lako ni {full_name}, "
+                f"una wategemezi {dependants}, "
+                f"na kituo chako kikuu ni {primary_facility}. "
+                f"Je, hii ni sahihi?"
+            )
+        else:
+            summary = (
+                f"Thank you. I have recorded: your name is {full_name}, "
+                f"you have {dependants} dependants, "
+                f"and your preferred facility is {primary_facility}. "
+                f"Is this correct?"
+            )
+
+        response.say(summary, voice="alice")
+
+        # Record confirmation (yes/no)
+        response.record(
+            max_length=5,
+            action=(
+                f"/twilio/voice/service/confirm?lang={lang}"
+                f"&full_name={full_name}&dependants={dependants}"
+                f"&primary_facility={primary_facility}"
+            ),
+            method="POST",
+            play_beep=True,
+            trim="trim-silence",
+        )
         return _twiml_response(response)
 
     response.say(q_list[question_index], voice="alice")
     response.record(
-        max_length=10,
-        action=f"/twilio/voice/service/callback?lang={lang}&question_index={question_index}",
+        max_length=15,
+        action=(
+            f"/twilio/voice/service/callback?lang={lang}"
+            f"&question_index={question_index}"
+            f"&full_name={full_name}&dependants={dependants}"
+            f"&primary_facility={primary_facility}"
+        ),
         method="POST",
         play_beep=True,
         trim="trim-silence",
@@ -369,11 +408,62 @@ async def service_callback(
     request: Request,
     lang: str = Query(default="en"),
     question_index: int = Query(default=0),
+    full_name: str = Query(default=""),
+    dependants: str = Query(default=""),
+    primary_facility: str = Query(default=""),
     RecordingUrl: str = Form(default=""),
 ):
-    """Advance to the next form question."""
+    """Process a form answer recording and advance to the next question.
+
+    In production the RecordingUrl would be downloaded, transcribed via Whisper,
+    and the answer stored. For the prototype, the answer is passed via query
+    params to the next step (the IVR caller hears the read-back at the end).
+    """
     await _validate_twilio_request(request)
     response = VoiceResponse()
+
+    # In production: download RecordingUrl → Whisper → parse answer
+    # For prototype: placeholder answers show the flow works end-to-end
+    placeholder_answers = ["(transcribed name)", "(transcribed number)", "(transcribed facility)"]
+    answer = placeholder_answers[question_index] if question_index < len(placeholder_answers) else ""
+
+    # Store the answer in the correct field
+    field_key = _SERVICE_FIELD_KEYS[question_index] if question_index < len(_SERVICE_FIELD_KEYS) else ""
+    if field_key == "full_name":
+        full_name = answer
+    elif field_key == "dependants":
+        dependants = answer
+    elif field_key == "primary_facility":
+        primary_facility = answer
+
     next_q = question_index + 1
-    response.redirect(f"/twilio/voice/service?lang={lang}&question_index={next_q}", method="POST")
+    response.redirect(
+        f"/twilio/voice/service?lang={lang}&question_index={next_q}"
+        f"&full_name={full_name}&dependants={dependants}"
+        f"&primary_facility={primary_facility}",
+        method="POST",
+    )
+    return _twiml_response(response)
+
+
+@router.post("/voice/service/confirm")
+async def service_confirm(
+    request: Request,
+    lang: str = Query(default="en"),
+    full_name: str = Query(default=""),
+    dependants: str = Query(default=""),
+    primary_facility: str = Query(default=""),
+    RecordingUrl: str = Form(default=""),
+):
+    """Handle the yes/no confirmation after the TTS read-back summary."""
+    await _validate_twilio_request(request)
+    response = VoiceResponse()
+
+    # In production: transcribe RecordingUrl, check for "yes"/"ndiyo"
+    # For prototype: assume confirmed
+    if lang == "sw":
+        response.say("Fomu yako imekamilika. Asante kwa kutumia VeriVoice.", voice="alice")
+    else:
+        response.say("Your form is complete. Thank you for using VeriVoice.", voice="alice")
+    response.hangup()
     return _twiml_response(response)

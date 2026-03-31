@@ -29,6 +29,17 @@ class ConsentResponse(BaseModel):
 
 class ServiceAccessResponse(BaseModel):
     form_id: str = Field(..., examples=["aa0e8400-e29b-41d4-a716-446655440000"])
-    question: str = Field(..., examples=["What is your full name?"])
-    transcribed_answer: str = Field(..., examples=["John Doe"])
+    question: str = Field(..., examples=["Please say your full name."])
+    field_key: str = Field(..., examples=["full_name"])
+    transcribed_answer: str = Field(..., examples=["Amina Juma Ochieng"])
+    raw_transcription: str = Field(..., examples=["Amina Juma Ochieng"])
+    questions_remaining: int = Field(..., ge=0, examples=[2])
     status: str = Field(default="completed", examples=["completed"])
+
+
+class ServiceFormSummary(BaseModel):
+    summary_text: str = Field(..., examples=["Thank you. I have recorded: your name is Amina..."])
+    audio_url: str = Field(..., examples=["/tmp/verivoice_tts/summary.wav"])
+    full_name: str
+    dependants: str
+    primary_facility: str
