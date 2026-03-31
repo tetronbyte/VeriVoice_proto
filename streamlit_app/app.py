@@ -60,7 +60,11 @@ if page == "Enroll":
                         st.success(f"Enrolled successfully!")
                         st.json(body)
                     else:
-                        st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+                        st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
                     st.error(f"Cannot connect to backend at {BACKEND_URL}. Is it running?")
 
@@ -132,7 +136,11 @@ elif page == "Authenticate":
                         col3.metric("Result", result.upper())
                         st.json(body)
                     else:
-                        st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+                        st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
@@ -186,7 +194,11 @@ elif page == "Consent":
                         st.code(body.get("digital_signature", ""), language=None)
                         st.json(body)
                     else:
-                        st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+                        st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
@@ -281,7 +293,11 @@ elif page == "Service Access":
                             st.session_state["svc_step"] = step + 1
                             st.rerun()
                         else:
-                            st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
+                            try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+                        st.error(f"Error {resp.status_code}: {detail}")
                     except httpx.ConnectError:
                         st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
@@ -318,7 +334,11 @@ elif page == "Service Access":
                             except Exception:
                                 st.caption(f"Audio saved at: {audio_path}")
                     else:
-                        st.error(f"Error {resp.status_code}: {resp.json().get('detail', resp.text)}")
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+                        st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
