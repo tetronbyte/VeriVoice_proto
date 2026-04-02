@@ -28,7 +28,11 @@ if page == "Enroll":
         st.header("Voice Enrollment  —  MOSIP Verified")
     else:
         st.header("Voice Enrollment  —  Unverified")
-    st.markdown("Register a citizen with **5 voice samples**.")
+    st.markdown(
+        "Register a citizen with **5 voice samples**.  \n"
+        "Upload your own pre-recorded audio files — say anything naturally "
+        "(e.g., read a sentence, introduce yourself). No specific phrase is required."
+    )
 
     # ── MOSIP-verified enrollment toggle ─────────────────────────────────
     use_mosip = False
@@ -51,7 +55,7 @@ if page == "Enroll":
         phone = st.text_input("Phone Number (E.164)", placeholder="+254700000000")
 
         st.markdown("---")
-        st.subheader("Upload 5 Audio Samples")
+        st.subheader("Upload 5 Audio Samples (Your Own Recordings)")
         audio_files = []
         cols = st.columns(5)
         for i in range(5):

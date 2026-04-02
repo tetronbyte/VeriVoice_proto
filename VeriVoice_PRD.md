@@ -120,8 +120,12 @@ Identity is established in one of two ways: (a) manual national ID entry
 (legacy flow), or (b) MOSIP e-Signet identity verification, where the
 citizen authenticates via MOSIP biometrics (fingerprint/iris/face) through
 an OIDC flow and receives a cryptographically verified MOSIP individual
-ID. A set of 5 spoken phrases are recorded. The system converts each
-audio into a 192-dimensional speaker embedding using ECAPA-TDNN,
+ID. A set of 5 voice samples are recorded. In the IVR (phone) flow, the
+system plays a randomly selected phrase via TTS for each sample and the
+citizen repeats it (pressing # to stop recording). In the Streamlit (web)
+flow, the citizen uploads their own pre-recorded audio files — no specific
+phrase is required. The system converts each audio into a 192-dimensional
+speaker embedding using ECAPA-TDNN,
 computes an L2-normalised centroid, encrypts the centroid using Paillier
 homomorphic encryption, and stores the ciphertext in SQLite. No raw
 audio is stored. When enrolled via e-Signet, the citizen's record is
@@ -892,8 +896,8 @@ webhook endpoints that Twilio calls during a voice session:
 -   **/twilio/voice/welcome:** Plays the welcome message (gTTS audio),
     prompts language selection.
 
--   **/twilio/voice/enroll:** Guides the user through speaking 5
-    phrases, recording each via Twilio \<Record\>.
+-   **/twilio/voice/enroll:** Plays 5 randomly selected phrases via TTS;
+    the caller repeats each one and presses # to stop recording.
 
 -   **/twilio/voice/authenticate:** Plays the challenge phrase, records
     the user's spoken response, triggers the dual-stage auth pipeline.
@@ -1097,8 +1101,10 @@ AudioPreprocessor class and has been independently tested.
 
 12. System creates a CITIZEN record in SQLite (identity_verified=False).
 
-13. Citizen speaks 5 sample phrases (prompted via gTTS or agent
-    guidance).
+13. Citizen provides 5 voice samples. In the IVR flow, the system plays
+    a randomly selected phrase via TTS for each sample and the citizen
+    repeats it (pressing # to stop). In the Streamlit flow, the citizen
+    uploads their own pre-recorded audio files (no specific phrase required).
 
 14. Each audio file is preprocessed by AudioPreprocessor.
 
@@ -1214,9 +1220,11 @@ hackathon demo:
     Verified MOSIP individual_id is returned and linked to citizen record.
 
 44. **Enrollment:** Agent enrolls a citizen (with or without MOSIP
-    verification). Citizen speaks 5 phrases. Voice template (encrypted
-    centroid) is created and stored. If e-Signet was used, enrollment is
-    identity-verified.
+    verification). In the IVR flow, the system plays 5 randomly selected
+    phrases via TTS and the citizen repeats each one (pressing # to stop).
+    In the Streamlit flow, the citizen uploads 5 pre-recorded audio files.
+    Voice template (encrypted centroid) is created and stored. If e-Signet
+    was used, enrollment is identity-verified.
 
 45. **Authentication:** Citizen "calls" the system (Twilio IVR or
     Streamlit upload). System plays a random challenge phrase. Citizen
@@ -1364,13 +1372,23 @@ recording. Silence detection is disabled (timeout=0) to prevent
 mid-sentence cutoffs from pauses. A bilingual prompt ("Press pound when
 you are done" / "Bonyeza # ukimaliza") plays before each recording.
 
+During IVR enrollment, the system randomly selects a phrase from the
+bilingual phrase pool for each of the 5 recordings and plays it via TTS.
+The caller repeats the phrase and presses # when done. This ensures
+natural voice variation across samples while giving the caller clear
+guidance on what to say.
+
 18.3 Streamlit Integration
 
 The Streamlit app serves as a secondary frontend for demo purposes. It
 provides file upload widgets for audio files, calls the FastAPI backend
 endpoints, and displays results (enrollment confirmation, match scores,
 transcriptions, consent tokens). It does not replace the Twilio IVR flow
-but provides a convenient browser-based demo path.
+but provides a convenient browser-based demo path. For enrollment, the
+Streamlit path does not use random phrase prompts — citizens upload their
+own pre-recorded audio files (any spoken content is acceptable, as the
+enrollment pipeline only extracts voice biometric features, not transcript
+content).
 
 18.4 Redis Usage
 

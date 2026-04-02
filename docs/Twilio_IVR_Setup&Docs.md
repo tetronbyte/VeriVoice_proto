@@ -316,7 +316,9 @@ The system redirects Amina to the enrollment flow.
 
 ### Phase 2: Enrollment (First-time User)
 
-Enrollment collects **5 voice samples** to build a voiceprint. The system also collects the caller's national ID number via keypad input.
+Enrollment collects **5 voice samples** to build a voiceprint. For each sample, the system randomly selects a phrase from the bilingual phrase pool, plays it via TTS, and the caller repeats it — pressing **#** to stop recording. The system also collects the caller's national ID number via keypad input.
+
+> **IVR vs Streamlit:** The IVR flow plays random TTS-prompted phrases for enrollment. The Streamlit (web) flow does not use random phrases — users upload their own pre-recorded audio files instead. Both paths produce the same voice biometric (ECAPA-TDNN embedding centroid).
 
 > **MOSIP Integration Note:** In the web UI (Streamlit), citizens can optionally verify their identity via MOSIP e-Signet before enrollment, which sets `identity_verified=True` on their citizen record. The IVR flow uses manual national ID entry (keypad) and sets `identity_verified=False`. Both paths create valid voice enrollments — the MOSIP verification adds a stronger identity anchor but is not required.
 
@@ -333,10 +335,12 @@ Amina types her national ID on the keypad: `29384756#`
 
 Twilio POSTs to: `POST /twilio/voice/enroll?lang=en&step=1` with `Digits=29384756`
 
-The system plays:
-> "Please say: The sun rises over the mountain every morning."
+The system randomly selects a phrase from the pool and plays it:
+> "Please say: The market opens early on Wednesday."
 
-*\[Beep\]* — Amina speaks the phrase. She finishes and presses **#** on her keypad. Twilio ends the recording and POSTs the `RecordingUrl` to the callback.
+(The phrase is randomly chosen each time — it may be any phrase from the bilingual pool.)
+
+*\[Beep\]* — Amina repeats the phrase. She finishes and presses **#** on her keypad. Twilio ends the recording and POSTs the `RecordingUrl` to the callback.
 
 **Step 6 — Recording callback (sample 1 saved)**
 
@@ -346,19 +350,14 @@ The system advances to sample 2.
 
 **Steps 7–14 — Samples 2 through 5**
 
-The same prompt-record-callback cycle repeats for each remaining phrase. Each time:
-1. System plays the phrase via `<Say>`
+The same prompt-record-callback cycle repeats for each remaining sample. Each time:
+1. System randomly selects a phrase from the pool and plays it via `<Say>`
 2. *\[Beep\]* plays
-3. Amina speaks the phrase
+3. Amina repeats the phrase
 4. She presses **#** — Twilio ends the recording
 5. Callback fires, system advances to the next sample
 
-| Sample | Phrase |
-|---|---|
-| 2 | "My voice is my password and it is unique." |
-| 3 | "The market opens early on Wednesday." |
-| 4 | "I confirm this request with my own voice." |
-| 5 | "Please verify my identity for this service." |
+Each sample gets a fresh random phrase from the bilingual phrase pool. Duplicates are possible but acceptable — what matters is capturing the caller's voice biometric, not phrase uniqueness.
 
 **Step 15 — Enrollment complete**
 
@@ -569,7 +568,7 @@ All endpoints are mounted under the `/twilio` prefix and return TwiML XML.
 | `/twilio/voice/welcome` | POST | Welcome message + language selection | -- |
 | `/twilio/voice/welcome/language` | POST | Handle language DTMF input | `Digits` (form) |
 | `/twilio/voice/welcome/action` | POST | Route to enroll or authenticate | `Digits` (form), `lang` (query) |
-| `/twilio/voice/enroll` | POST | National ID input or play recording prompt | `lang`, `step`, `national_id` (query) |
+| `/twilio/voice/enroll` | POST | National ID input or play random phrase + record | `lang`, `step`, `national_id` (query) |
 | `/twilio/voice/enroll/callback` | POST | Handle completed enrollment recording | `RecordingUrl` (form), `lang`, `step`, `national_id` (query) |
 | `/twilio/voice/authenticate` | POST | Play challenge phrase + record | `lang` (query) |
 | `/twilio/voice/authenticate/callback` | POST | Process auth recording | `RecordingUrl` (form), `lang`, `challenge_id` (query) |
@@ -605,11 +604,11 @@ WELCOME
                         |                     |
                         |                     +-- Enter national ID (#)
                         |                     |
-                        |                     +-- [Beep] Record sample 1 --> presses #
-                        |                     +-- [Beep] Record sample 2 --> presses #
-                        |                     +-- [Beep] Record sample 3 --> presses #
-                        |                     +-- [Beep] Record sample 4 --> presses #
-                        |                     +-- [Beep] Record sample 5 --> presses #
+                        |                     +-- Play random phrase 1 --> [Beep] Repeat --> presses #
+                        |                     +-- Play random phrase 2 --> [Beep] Repeat --> presses #
+                        |                     +-- Play random phrase 3 --> [Beep] Repeat --> presses #
+                        |                     +-- Play random phrase 4 --> [Beep] Repeat --> presses #
+                        |                     +-- Play random phrase 5 --> [Beep] Repeat --> presses #
                         |                           |
                         |                           v
                         |                     ENROLL_COMPLETE --> Hangup
@@ -754,7 +753,7 @@ ngrok http 8000
 1. Call your Twilio number from the citizen's phone
 2. Press **1** for English, then **1** to enroll
 3. Enter the national ID on the keypad, press **#**
-4. Speak the 5 enrollment phrases (speak, then go silent after each)
+4. For each of 5 samples, listen to the random phrase, repeat it, and press **#**
 5. Enrollment completes -- the citizen now has a voice template with `identity_verified=False`
 
 **Step 4 -- Link the MOSIP identity to the enrolled citizen**
@@ -915,8 +914,8 @@ Amina dials +1234567890
 "Enter your national ID followed by #."              --> Types 29384756#
   |
   v
-"Please say: The sun rises over the mountain..."     --> [Beep] Speaks --> presses #
-  |                                                       (x5 phrases)
+"Please say: <random phrase from pool>..."             --> [Beep] Speaks --> presses #
+  |                                                       (x5 random phrases)
   v
 "Enrollment complete. Thank you."                    --> Hangup
   |

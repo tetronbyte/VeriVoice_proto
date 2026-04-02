@@ -111,7 +111,7 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 | Endpoint | Description |
 |---|---|
 | `/twilio/voice/welcome` | Welcome + language selection |
-| `/twilio/voice/enroll` | 5-phrase enrollment via `<Record>` |
+| `/twilio/voice/enroll` | 5 random-phrase enrollment via `<Record>` |
 | `/twilio/voice/authenticate` | Challenge phrase auth |
 | `/twilio/voice/consent` | Verbal consent recording |
 | `/twilio/voice/service` | Health insurance form Q&A (3 questions + read-back) |
@@ -271,6 +271,22 @@ To test the phone-based IVR flow:
 - **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.2.1 (2026-04-02)
+
+**Changes**
+- **IVR random enrollment phrases** -- Each of the 5 enrollment recordings now plays a randomly selected phrase from the phrase pool (via `pick_random_enrollment_phrase()`), replacing the previous fixed phrase order. Phrases are drawn from the same bilingual pool used by the challenge service (`twilio_integration/ivr_flow.py`, `twilio_integration/webhook_handler.py`)
+- **Streamlit enrollment clarification** -- Enrollment UI now explicitly states that users upload their own pre-recorded audio files with no specific phrase required. The IVR is the only path that uses random TTS-prompted phrases (`streamlit_app/app.py`)
+
+**Files Changed**
+| File | Change |
+|---|---|
+| `twilio_integration/ivr_flow.py` | Replaced fixed `ENROLLMENT_PROMPTS` dict with `pick_random_enrollment_phrase()` function |
+| `twilio_integration/webhook_handler.py` | Uses `pick_random_enrollment_phrase()` instead of indexing fixed prompts |
+| `streamlit_app/app.py` | Updated enrollment UI text to clarify free-form audio upload |
+| `README.md` | Updated changelog and enrollment descriptions |
+| `VeriVoice_PRD.md` | Updated enrollment flow descriptions for IVR vs Streamlit |
+| `docs/Twilio_IVR_Setup&Docs.md` | Updated enrollment walkthrough to reflect random phrases |
 
 ### v1.2.0 (2026-04-02)
 

@@ -4,7 +4,10 @@ State is passed via URL query parameters (stateless approach that works
 with Twilio's webhook model without requiring server-side session storage).
 """
 
+import random
 from enum import Enum
+
+from app.services.challenge_service import PHRASE_POOLS
 
 
 class IVRState(str, Enum):
@@ -25,20 +28,12 @@ class IVRState(str, Enum):
     SERVICE_COMPLETE = "service_complete"
 
 
-# Enrollment prompt phrases spoken before each of the 5 recordings
-ENROLLMENT_PROMPTS = {
-    "en": [
-        "Please say: The sun rises over the mountain every morning.",
-        "Please say: My voice is my password and it is unique.",
-        "Please say: The market opens early on Wednesday.",
-        "Please say: I confirm this request with my own voice.",
-        "Please say: Please verify my identity for this service.",
-    ],
-    "sw": [
-        "Tafadhali sema: Jua linachomoza juu ya mlima kila asubuhi.",
-        "Tafadhali sema: Sauti yangu ndiyo nenosiri langu.",
-        "Tafadhali sema: Soko linafunguliwa mapema siku ya Jumatano.",
-        "Tafadhali sema: Ninathibitisha ombi hili kwa sauti yangu.",
-        "Tafadhali sema: Tafadhali thibitisha utambulisho wangu.",
-    ],
-}
+def pick_random_enrollment_phrase(language: str = "en") -> str:
+    """Select a random phrase from the pool for an IVR enrollment recording.
+
+    Each call picks independently so that the 5 enrollment prompts are
+    randomly varied (duplicates are possible but acceptable — what matters
+    is voice biometric diversity, not phrase uniqueness).
+    """
+    pool = PHRASE_POOLS.get(language, PHRASE_POOLS["en"])
+    return random.choice(pool)

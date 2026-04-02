@@ -32,7 +32,7 @@ from app.services.encryption_service import EncryptionService
 from app.services.matching_service import MatchingService
 from app.services.transcription_service import TranscriptionService
 from app.services.tts_service import TTSService
-from twilio_integration.ivr_flow import ENROLLMENT_PROMPTS, IVRState
+from twilio_integration.ivr_flow import IVRState, pick_random_enrollment_phrase
 
 router = APIRouter()
 
@@ -171,9 +171,12 @@ async def enroll_prompt(
         response.hangup()
         return _twiml_response(response)
 
-    # Play prompt and record
-    prompts = ENROLLMENT_PROMPTS.get(lang, ENROLLMENT_PROMPTS["en"])
-    prompt_text = prompts[step]
+    # Pick a random phrase and prompt the caller to repeat it
+    phrase = pick_random_enrollment_phrase(language=lang)
+    if lang == "sw":
+        prompt_text = f"Tafadhali sema: {phrase}"
+    else:
+        prompt_text = f"Please say: {phrase}"
 
     response.say(prompt_text, voice="alice")
     if lang == "sw":
