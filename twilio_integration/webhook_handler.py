@@ -5,6 +5,7 @@ Twilio request validation is enforced when TWILIO_AUTH_TOKEN is configured.
 """
 
 import io
+import logging
 import tempfile
 import os
 
@@ -34,6 +35,8 @@ from app.services.transcription_service import TranscriptionService
 from app.services.tts_service import TTSService
 from twilio_integration.ivr_flow import IVRState, pick_random_enrollment_phrase
 
+logger = logging.getLogger("verivoice.ivr")
+
 router = APIRouter()
 
 _preprocessor = AudioPreprocessor()
@@ -51,13 +54,16 @@ def _twiml_response(response: VoiceResponse) -> Response:
 async def _validate_twilio_request(request: Request) -> None:
     """Validate that the request originated from Twilio (if auth token is configured)."""
     if not settings.TWILIO_AUTH_TOKEN:
+        logger.debug("[TWILIO-VALIDATE] Auth token not set — skipping signature validation")
         return  # Skip validation in development
     validator = RequestValidator(settings.TWILIO_AUTH_TOKEN)
     form = await request.form()
     url = str(request.url)
     signature = request.headers.get("X-Twilio-Signature", "")
     if not validator.validate(url, dict(form), signature):
+        logger.warning("[TWILIO-VALIDATE] FAILED — invalid Twilio signature for %s", url)
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+    logger.debug("[TWILIO-VALIDATE] OK — valid signature for %s", url)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -67,6 +73,7 @@ async def _validate_twilio_request(request: Request) -> None:
 @router.post("/voice/welcome")
 async def welcome(request: Request):
     """Play welcome message and prompt for language selection via DTMF."""
+    logger.info("[IVR] ── WELCOME ── Playing language selection prompt")
     await _validate_twilio_request(request)
     response = VoiceResponse()
     gather = Gather(
@@ -94,6 +101,7 @@ async def welcome_language(
     """Handle language selection and prompt for action."""
     await _validate_twilio_request(request)
     lang = "sw" if Digits == "2" else "en"
+    logger.info("[IVR] ── LANGUAGE ── Selected: %s (Digits=%s)", lang, Digits)
     response = VoiceResponse()
 
     if lang == "sw":
@@ -120,12 +128,18 @@ async def welcome_action(
 ):
     """Route to enroll or authenticate based on DTMF input."""
     await _validate_twilio_request(request)
+    action = {
+        "1": "ENROLL",
+        "2": "AUTHENTICATE",
+    }.get(Digits, "INVALID")
+    logger.info("[IVR] ── ACTION ── Routing to %s (lang=%s, Digits=%s)", action, lang, Digits)
     response = VoiceResponse()
     if Digits == "1":
         response.redirect(f"/twilio/voice/enroll?lang={lang}&step=0", method="POST")
     elif Digits == "2":
         response.redirect(f"/twilio/voice/authenticate?lang={lang}", method="POST")
     else:
+        logger.warning("[IVR] ── ACTION ── Invalid selection '%s', restarting welcome", Digits)
         response.say("Invalid selection.", voice="alice")
         response.redirect("/twilio/voice/welcome", method="POST")
     return _twiml_response(response)
@@ -148,6 +162,7 @@ async def enroll_prompt(
 
     if step == 0 and not national_id:
         # First step: gather national ID via DTMF
+        logger.info("[IVR] ── ENROLL step=0 ── Prompting for national ID (lang=%s)", lang)
         gather = Gather(
             action=f"/twilio/voice/enroll?lang={lang}&step=1",
             method="POST",
@@ -167,6 +182,8 @@ async def enroll_prompt(
 
     if step >= settings.ENROLLMENT_PHRASES:
         # All 5 recordings done — handled by enroll_callback
+        logger.info("[IVR] ── ENROLL COMPLETE ── All %d samples recorded (nid=%s, lang=%s)",
+                     settings.ENROLLMENT_PHRASES, nid, lang)
         response.say("Enrollment complete. Thank you." if lang == "en" else "Usajili umekamilika. Asante.", voice="alice")
         response.hangup()
         return _twiml_response(response)
@@ -177,6 +194,9 @@ async def enroll_prompt(
         prompt_text = f"Tafadhali sema: {phrase}"
     else:
         prompt_text = f"Please say: {phrase}"
+
+    logger.info("[IVR] ── ENROLL step=%d/%d ── Playing phrase: '%s' (nid=%s, lang=%s)",
+                 step + 1, settings.ENROLLMENT_PHRASES, phrase, nid, lang)
 
     response.say(prompt_text, voice="alice")
     if lang == "sw":
@@ -205,16 +225,22 @@ async def enroll_callback(
 ):
     """Handle a completed enrollment recording, then advance to the next step."""
     await _validate_twilio_request(request)
+    logger.info("[IVR] ── ENROLL CALLBACK step=%d ── RecordingUrl=%s (nid=%s)",
+                 step + 1, RecordingUrl[:80] if RecordingUrl else "(none)", national_id)
     response = VoiceResponse()
 
     # Store the recording URL in session (via query params for next step)
     next_step = step + 1
     if next_step < settings.ENROLLMENT_PHRASES:
+        logger.info("[IVR] ── ENROLL CALLBACK ── Advancing to step %d/%d",
+                     next_step + 1, settings.ENROLLMENT_PHRASES)
         response.redirect(
             f"/twilio/voice/enroll?lang={lang}&step={next_step}&national_id={national_id}",
             method="POST",
         )
     else:
+        logger.info("[IVR] ── ENROLL CALLBACK ── All %d samples received — completing enrollment",
+                     settings.ENROLLMENT_PHRASES)
         if lang == "sw":
             response.say("Usajili umekamilika. Asante.", voice="alice")
         else:
@@ -241,6 +267,8 @@ async def authenticate_prompt(
     challenge = _challenge_service.generate_challenge(language=lang)
     phrase = challenge["phrase_text"]
     challenge_id = challenge["challenge_id"]
+    logger.info("[IVR] ── AUTHENTICATE ── Challenge generated: id=%s phrase='%s' (lang=%s)",
+                 challenge_id, phrase, lang)
 
     if lang == "sw":
         response.say(f"Tafadhali sema: {phrase}", voice="alice")
@@ -270,20 +298,25 @@ async def authenticate_callback(
 ):
     """Process the authentication recording and announce the result."""
     await _validate_twilio_request(request)
+    logger.info("[IVR] ── AUTH CALLBACK ── challenge_id=%s RecordingUrl=%s",
+                 challenge_id, RecordingUrl[:80] if RecordingUrl else "(none)")
     response = VoiceResponse()
 
     if not RecordingUrl:
+        logger.warning("[IVR] ── AUTH CALLBACK ── No recording received — retrying")
         response.say("No recording received. Please try again.", voice="alice")
         response.redirect(f"/twilio/voice/authenticate?lang={lang}", method="POST")
         return _twiml_response(response)
 
     # In production: download RecordingUrl, run through auth pipeline.
     # For prototype, we announce that processing would happen here.
+    logger.info("[IVR] ── AUTH CALLBACK ── Processing voice (prototype: placeholder)")
     if lang == "sw":
         response.say("Sauti yako inachakatwa. Tafadhali subiri.", voice="alice")
     else:
         response.say("Your voice is being processed. Please wait.", voice="alice")
 
+    logger.info("[IVR] ── AUTH CALLBACK ── Authentication complete — hanging up")
     response.say("Authentication complete. Thank you." if lang == "en" else "Uthibitishaji umekamilika. Asante.", voice="alice")
     response.hangup()
     return _twiml_response(response)
@@ -300,6 +333,7 @@ async def consent_prompt(
 ):
     """Read consent text and record the user's verbal affirmation."""
     await _validate_twilio_request(request)
+    logger.info("[IVR] ── CONSENT ── Playing consent text (lang=%s)", lang)
     response = VoiceResponse()
 
     if lang == "sw":
@@ -332,8 +366,11 @@ async def consent_callback(
 ):
     """Process consent recording."""
     await _validate_twilio_request(request)
+    logger.info("[IVR] ── CONSENT CALLBACK ── RecordingUrl=%s (lang=%s)",
+                 RecordingUrl[:80] if RecordingUrl else "(none)", lang)
     response = VoiceResponse()
     response.say("Your consent has been recorded. Thank you." if lang == "en" else "Idhini yako imerekodiwa. Asante.", voice="alice")
+    logger.info("[IVR] ── CONSENT CALLBACK ── Consent recorded — hanging up")
     response.hangup()
     return _twiml_response(response)
 
@@ -375,6 +412,8 @@ async def service_prompt(
 
     if question_index >= len(q_list):
         # All 3 questions answered — play TTS read-back summary
+        logger.info("[IVR] ── SERVICE ── All 3 questions answered — playing read-back summary "
+                     "(name=%s, deps=%s, facility=%s)", full_name, dependants, primary_facility)
         if lang == "sw":
             summary = (
                 f"Asante. Nimekusanya: jina lako ni {full_name}, "
@@ -412,6 +451,8 @@ async def service_prompt(
         )
         return _twiml_response(response)
 
+    logger.info("[IVR] ── SERVICE Q%d/%d ── Playing question: '%s' (lang=%s)",
+                 question_index + 1, len(q_list), q_list[question_index], lang)
     response.say(q_list[question_index], voice="alice")
     if lang == "sw":
         response.say("Bonyeza # ukimaliza.", voice="alice")
@@ -451,6 +492,8 @@ async def service_callback(
     params to the next step (the IVR caller hears the read-back at the end).
     """
     await _validate_twilio_request(request)
+    logger.info("[IVR] ── SERVICE CALLBACK Q%d ── RecordingUrl=%s",
+                 question_index + 1, RecordingUrl[:80] if RecordingUrl else "(none)")
     response = VoiceResponse()
 
     # In production: download RecordingUrl → Whisper → parse answer
@@ -466,6 +509,9 @@ async def service_callback(
         dependants = answer
     elif field_key == "primary_facility":
         primary_facility = answer
+
+    logger.info("[IVR] ── SERVICE CALLBACK ── field=%s answer='%s' — advancing to Q%d",
+                 field_key, answer, question_index + 2)
 
     next_q = question_index + 1
     response.redirect(
@@ -488,6 +534,8 @@ async def service_confirm(
 ):
     """Handle the yes/no confirmation after the TTS read-back summary."""
     await _validate_twilio_request(request)
+    logger.info("[IVR] ── SERVICE CONFIRM ── RecordingUrl=%s (name=%s, deps=%s, facility=%s)",
+                 RecordingUrl[:80] if RecordingUrl else "(none)", full_name, dependants, primary_facility)
     response = VoiceResponse()
 
     # In production: transcribe RecordingUrl, check for "yes"/"ndiyo"
@@ -496,5 +544,6 @@ async def service_confirm(
         response.say("Fomu yako imekamilika. Asante kwa kutumia VeriVoice.", voice="alice")
     else:
         response.say("Your form is complete. Thank you for using VeriVoice.", voice="alice")
+    logger.info("[IVR] ── SERVICE CONFIRM ── Form complete — hanging up")
     response.hangup()
     return _twiml_response(response)

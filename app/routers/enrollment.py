@@ -1,6 +1,7 @@
 """POST /api/v1/enroll — Voice enrollment endpoint (PRD Section 10.1)."""
 
 import io
+import logging
 import tempfile
 
 import numpy as np
@@ -12,6 +13,8 @@ import redis
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+
+logger = logging.getLogger("verivoice.enroll")
 from app.db.crud import create_citizen, create_voice_template, get_citizen_by_mosip_id, get_citizen_by_national_id
 from app.db.database import get_db
 from app.schemas.enrollment import EnrollmentResponse
@@ -45,6 +48,10 @@ async def enroll(
     valid e-Signet callback (checked via Redis) and creates the citizen
     with identity_verified=True.
     """
+    logger.info("[ENROLL] ── START ── national_id=%s lang=%s phone=%s mosip_id=%s audio_count=%d",
+                 national_id_number, preferred_language, phone_number,
+                 mosip_individual_id or "(none)", len(audio_files))
+
     # ── Validate audio count ─────────────────────────────────────────────
     if len(audio_files) != settings.ENROLLMENT_PHRASES:
         raise HTTPException(
@@ -54,6 +61,7 @@ async def enroll(
 
     # ── Check for duplicate national ID ──────────────────────────────────
     if get_citizen_by_national_id(db, national_id_number) is not None:
+        logger.warning("[ENROLL] ── DUPLICATE ── National ID '%s' already enrolled", national_id_number)
         raise HTTPException(
             status_code=409,
             detail=f"National ID '{national_id_number}' is already enrolled",
@@ -80,6 +88,7 @@ async def enroll(
                 detail="This MOSIP individual_id is already linked to another citizen",
             )
         identity_verified = True
+        logger.info("[ENROLL] ── MOSIP ── Verified MOSIP ID consumed: %s", mosip_individual_id)
 
     # ── Create citizen record ────────────────────────────────────────────
     try:
@@ -98,11 +107,16 @@ async def enroll(
             detail="This MOSIP individual_id is already linked to another citizen",
         )
 
+    logger.info("[ENROLL] ── CITIZEN CREATED ── citizen_id=%s identity_verified=%s",
+                 citizen.citizen_id, citizen.identity_verified)
+
     # ── Process each audio file ──────────────────────────────────────────
     embedding_service = EmbeddingService()
     embeddings: list[np.ndarray] = []
 
     for i, upload in enumerate(audio_files):
+        logger.info("[ENROLL] ── AUDIO %d/%d ── Processing file: %s (%s)",
+                     i + 1, len(audio_files), upload.filename, upload.content_type)
         raw_bytes = await upload.read()
 
         # Write to a temp WAV so librosa/preprocessor can load it
@@ -112,14 +126,24 @@ async def enroll(
 
         try:
             preprocessed = _preprocessor.process(tmp_path)
+            logger.info("[ENROLL] ── AUDIO %d/%d ── Preprocessed: %d samples (%.2fs)",
+                         i + 1, len(audio_files), len(preprocessed),
+                         len(preprocessed) / settings.SAMPLE_RATE)
             embedding = embedding_service.extract_embedding(preprocessed)
+            logger.info("[ENROLL] ── AUDIO %d/%d ── Embedding extracted: dim=%d norm=%.4f",
+                         i + 1, len(audio_files), len(embedding), float(np.linalg.norm(embedding)))
             embeddings.append(embedding)
+        except Exception as exc:
+            logger.error("[ENROLL] ── AUDIO %d/%d ── FAILED: %s", i + 1, len(audio_files), exc)
+            raise
         finally:
             import os
             os.unlink(tmp_path)
 
     # ── Compute centroid and encrypt ─────────────────────────────────────
+    logger.info("[ENROLL] ── CENTROID ── Computing centroid from %d embeddings", len(embeddings))
     centroid = embedding_service.compute_centroid(embeddings)
+    logger.info("[ENROLL] ── ENCRYPT ── Encrypting centroid with Paillier HE (%d-bit)", settings.PAILLIER_BITS)
     ciphertext_bytes = _encryption_service.encrypt_centroid(centroid)
     # centroid is already zeroed by encrypt_centroid
 
@@ -127,6 +151,7 @@ async def enroll(
     for emb in embeddings:
         emb[:] = 0.0
     embeddings.clear()
+    logger.info("[ENROLL] ── SECURITY ── Plaintext centroid and embeddings zeroed from memory")
 
     # ── Store voice template ─────────────────────────────────────────────
     template = create_voice_template(
@@ -134,6 +159,8 @@ async def enroll(
         citizen_id=citizen.citizen_id,
         he_ciphertext=ciphertext_bytes,
     )
+    logger.info("[ENROLL] ── DONE ── template_id=%s citizen_id=%s identity_verified=%s",
+                 template.template_id, citizen.citizen_id, citizen.identity_verified)
 
     return EnrollmentResponse(
         citizen_id=citizen.citizen_id,

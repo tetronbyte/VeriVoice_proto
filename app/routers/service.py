@@ -1,11 +1,14 @@
 """POST /api/v1/service-access — Health insurance form via voice (PRD Section 10.1)."""
 
+import logging
 import os
 import tempfile
 import uuid
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger("verivoice.service")
 
 from app.db.crud import get_citizen_by_id, get_consent_token
 from app.db.database import get_db
@@ -65,18 +68,25 @@ async def service_access(
 
     Pipeline: verify consent token → Whisper transcribe answer → return response.
     """
+    logger.info("[SERVICE] ── START ── citizen_id=%s token=%s question_index=%d",
+                 citizen_id, consent_token_id, question_index)
+
     # ── Verify citizen exists ────────────────────────────────────────────
     citizen = get_citizen_by_id(db, citizen_id)
     if citizen is None:
+        logger.warning("[SERVICE] ── Citizen not found: %s", citizen_id)
         raise HTTPException(status_code=404, detail="Citizen not found")
 
     # ── Verify consent token is valid and not revoked ────────────────────
     token = get_consent_token(db, consent_token_id)
     if token is None:
+        logger.warning("[SERVICE] ── Consent token not found: %s", consent_token_id)
         raise HTTPException(status_code=404, detail="Consent token not found")
     if token.citizen_id != citizen_id:
+        logger.warning("[SERVICE] ── Token %s belongs to %s, not %s", consent_token_id, token.citizen_id, citizen_id)
         raise HTTPException(status_code=403, detail="Consent token does not belong to this citizen")
     if token.is_revoked:
+        logger.warning("[SERVICE] ── Token %s is revoked", consent_token_id)
         raise HTTPException(status_code=403, detail="Consent token has been revoked")
 
     # ── Resolve language and question ────────────────────────────────────
@@ -85,6 +95,8 @@ async def service_access(
     qi = min(question_index, len(q_list) - 1)
     question = q_list[qi]
     field_key = FORM_FIELD_KEYS[qi]
+    logger.info("[SERVICE] ── Q%d/%d field=%s lang=%s question='%s'",
+                 qi + 1, len(q_list), field_key, lang, question)
 
     # ── Read and preprocess audio ────────────────────────────────────────
     raw_bytes = await audio_file.read()
@@ -94,20 +106,26 @@ async def service_access(
 
     try:
         preprocessed = _preprocessor.process(tmp_path)
+        logger.info("[SERVICE] ── Audio preprocessed: %d samples", len(preprocessed))
     finally:
         os.unlink(tmp_path)
 
     # ── Transcribe the answer ────────────────────────────────────────────
+    logger.info("[SERVICE] ── Transcribing answer (lang=%s, model=%s)",
+                 lang, "w2v-BERT" if lang == "sw" else "Whisper")
     transcription_service = TranscriptionService()
     raw_answer = transcription_service.transcribe(preprocessed, language=lang)
+    logger.info("[SERVICE] ── Raw transcript: '%s'", raw_answer)
 
     # Parse dependants to a number when applicable
     if field_key == "dependants":
         answer = _parse_dependants(raw_answer)
+        logger.info("[SERVICE] ── Parsed dependants: '%s' → '%s'", raw_answer, answer)
     else:
         answer = raw_answer
 
     remaining = len(q_list) - qi - 1
+    logger.info("[SERVICE] ── DONE ── field=%s answer='%s' remaining=%d", field_key, answer, remaining)
 
     return ServiceAccessResponse(
         form_id=str(uuid.uuid4()),
@@ -130,6 +148,8 @@ async def service_summary(
     language: str = Form(default="en"),
 ):
     """Generate a TTS read-back summary of the completed form answers."""
+    logger.info("[SERVICE-SUMMARY] ── Generating read-back (lang=%s name=%s deps=%s facility=%s)",
+                 language, full_name, dependants, primary_facility)
     # ── Verify citizen exists ────────────────────────────────────────────
     if language == "sw":
         summary_text = (
@@ -147,6 +167,7 @@ async def service_summary(
         )
 
     audio_path = _tts_service.synthesize_to_wav(summary_text, language=language)
+    logger.info("[SERVICE-SUMMARY] ── TTS audio: %s", audio_path)
 
     return ServiceFormSummary(
         summary_text=summary_text,

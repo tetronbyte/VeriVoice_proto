@@ -1,6 +1,7 @@
 """VeriVoice Streamlit Demo UI — calls the FastAPI backend for all four flows."""
 
 import os
+import time
 
 import httpx
 import streamlit as st
@@ -20,10 +21,17 @@ else:
     st.sidebar.caption("MOSIP Identity: Not verified")
 
 
+def _log(tag: str, msg: str) -> None:
+    """Print a timestamped log line to the Streamlit terminal."""
+    ts = time.strftime("%H:%M:%S")
+    print(f"{ts}  [STREAMLIT {tag}]  {msg}", flush=True)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ENROLL
 # ═════════════════════════════════════════════════════════════════════════════
 if page == "Enroll":
+    _log("NAV", "Page: Enroll")
     if st.session_state.get("mosip_individual_id"):
         st.header("Voice Enrollment  —  MOSIP Verified")
     else:
@@ -66,11 +74,18 @@ if page == "Enroll":
         submitted = st.form_submit_button("Enroll Citizen")
 
     if submitted:
+        _log("ENROLL", f"Form submitted: national_id={national_id} lang={language} phone={phone} "
+             f"mosip={'yes' if use_mosip else 'no'}")
         if not national_id or not phone:
+            _log("ENROLL", "VALIDATION FAILED — missing national_id or phone")
             st.error("National ID and Phone Number are required.")
         elif any(f is None for f in audio_files):
+            uploaded = sum(1 for f in audio_files if f is not None)
+            _log("ENROLL", f"VALIDATION FAILED — only {uploaded}/5 audio files uploaded")
             st.error("All 5 audio samples are required.")
         else:
+            for i, f in enumerate(audio_files):
+                _log("ENROLL", f"  Audio {i+1}/5: {f.name} ({f.size} bytes, {f.type})")
             files = [
                 ("audio_files", (f"sample_{i}.wav", audio_files[i].getvalue(), "audio/wav"))
                 for i in range(5)
@@ -83,11 +98,17 @@ if page == "Enroll":
             if use_mosip and mosip_id_value:
                 data["mosip_individual_id"] = mosip_id_value
 
+            _log("ENROLL", f"Sending POST {API}/enroll ...")
             with st.spinner("Enrolling..."):
                 try:
+                    t0 = time.time()
                     resp = httpx.post(f"{API}/enroll", data=data, files=files, timeout=120.0)
+                    elapsed = time.time() - t0
+                    _log("ENROLL", f"Response: {resp.status_code} ({elapsed:.1f}s)")
                     if resp.status_code == 200:
                         body = resp.json()
+                        _log("ENROLL", f"SUCCESS — citizen_id={body['citizen_id']} "
+                             f"template_id={body['template_id']} verified={body.get('identity_verified')}")
                         if body.get("identity_verified"):
                             st.success("Enrolled successfully with MOSIP-verified identity!")
                         else:
@@ -98,8 +119,10 @@ if page == "Enroll":
                             detail = resp.json().get("detail", resp.text)
                         except Exception:
                             detail = resp.text
+                        _log("ENROLL", f"ERROR {resp.status_code}: {detail}")
                         st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
+                    _log("ENROLL", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                     st.error(f"Cannot connect to backend at {BACKEND_URL}. Is it running?")
 
 
@@ -107,6 +130,7 @@ if page == "Enroll":
 # AUTHENTICATE
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "Authenticate":
+    _log("NAV", "Page: Authenticate")
     if st.session_state.get("mosip_individual_id"):
         st.header("Voice Authentication  —  MOSIP Verified")
     else:
@@ -118,11 +142,16 @@ elif page == "Authenticate":
 
     # ── Get Challenge ────────────────────────────────────────────────────
     if st.button("Get Challenge Phrase"):
+        _log("AUTH", f"Requesting challenge phrase (lang={lang})")
         try:
+            t0 = time.time()
             resp = httpx.get(f"{API}/challenge", params={"language": lang}, timeout=30.0)
+            elapsed = time.time() - t0
+            _log("AUTH", f"Challenge response: {resp.status_code} ({elapsed:.1f}s)")
             if resp.status_code == 200:
                 challenge = resp.json()
                 st.session_state["challenge"] = challenge
+                _log("AUTH", f"Challenge: id={challenge['challenge_id']} phrase='{challenge['phrase_text']}'")
                 st.success(f"Challenge: **{challenge['phrase_text']}**")
                 if challenge.get("audio_url"):
                     try:
@@ -130,8 +159,10 @@ elif page == "Authenticate":
                     except Exception:
                         st.info("Audio file path returned — playback may require local file access.")
             else:
+                _log("AUTH", f"Challenge ERROR {resp.status_code}: {resp.text}")
                 st.error(f"Error {resp.status_code}: {resp.text}")
         except httpx.ConnectError:
+            _log("AUTH", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
             st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
     # Show current challenge if stored
@@ -143,24 +174,36 @@ elif page == "Authenticate":
 
     if st.button("Authenticate"):
         if not citizen_id:
+            _log("AUTH", "VALIDATION FAILED — no citizen_id")
             st.error("Enter a Citizen ID.")
         elif "challenge" not in st.session_state:
+            _log("AUTH", "VALIDATION FAILED — no challenge phrase")
             st.error("Get a challenge phrase first.")
         elif auth_audio is None:
+            _log("AUTH", "VALIDATION FAILED — no audio uploaded")
             st.error("Upload your spoken response audio.")
         else:
+            challenge_id = st.session_state["challenge"]["challenge_id"]
+            _log("AUTH", f"Authenticating: citizen={citizen_id} challenge={challenge_id} "
+                 f"audio={auth_audio.name} ({auth_audio.size} bytes)")
             data = {
                 "citizen_id": citizen_id,
-                "challenge_phrase_id": st.session_state["challenge"]["challenge_id"],
+                "challenge_phrase_id": challenge_id,
             }
             files = [("audio_file", ("response.wav", auth_audio.getvalue(), "audio/wav"))]
             with st.spinner("Authenticating..."):
                 try:
+                    t0 = time.time()
                     resp = httpx.post(f"{API}/authenticate", data=data, files=files, timeout=120.0)
+                    elapsed = time.time() - t0
+                    _log("AUTH", f"Response: {resp.status_code} ({elapsed:.1f}s)")
                     if resp.status_code == 200:
                         body = resp.json()
                         score = body["voice_match_score"]
                         result = body["result"]
+                        _log("AUTH", f"RESULT: {result.upper()} — voice_score={score:.4f} "
+                             f"transcript_match={body['transcript_match']} "
+                             f"transcript_score={body.get('transcript_match_score', 'N/A')}")
 
                         if result == "granted":
                             st.success(f"ACCESS GRANTED")
@@ -177,8 +220,10 @@ elif page == "Authenticate":
                             detail = resp.json().get("detail", resp.text)
                         except Exception:
                             detail = resp.text
+                        _log("AUTH", f"ERROR {resp.status_code}: {detail}")
                         st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
+                    _log("AUTH", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
 
@@ -186,6 +231,7 @@ elif page == "Authenticate":
 # CONSENT
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "Consent":
+    _log("NAV", "Page: Consent")
     st.header("Voice Consent")
     st.markdown("Record verbal consent and generate a **cryptographically signed token**.")
 
@@ -212,10 +258,14 @@ elif page == "Consent":
 
     if st.button("Submit Consent"):
         if not citizen_id:
+            _log("CONSENT", "VALIDATION FAILED — no citizen_id")
             st.error("Enter a Citizen ID.")
         elif consent_audio is None:
+            _log("CONSENT", "VALIDATION FAILED — no audio uploaded")
             st.error("Upload your consent audio.")
         else:
+            _log("CONSENT", f"Submitting: citizen={citizen_id} ministry={ministry_code} "
+                 f"scope={data_scope} audio={consent_audio.name} ({consent_audio.size} bytes)")
             data = {
                 "citizen_id": citizen_id,
                 "ministry_code": ministry_code,
@@ -224,9 +274,13 @@ elif page == "Consent":
             files = [("audio_file", ("consent.wav", consent_audio.getvalue(), "audio/wav"))]
             with st.spinner("Processing consent..."):
                 try:
+                    t0 = time.time()
                     resp = httpx.post(f"{API}/consent", data=data, files=files, timeout=120.0)
+                    elapsed = time.time() - t0
+                    _log("CONSENT", f"Response: {resp.status_code} ({elapsed:.1f}s)")
                     if resp.status_code == 200:
                         body = resp.json()
+                        _log("CONSENT", f"SUCCESS — token_id={body.get('token_id')}")
                         st.success("Consent recorded and signed!")
                         st.code(body.get("digital_signature", ""), language=None)
                         st.json(body)
@@ -235,8 +289,10 @@ elif page == "Consent":
                             detail = resp.json().get("detail", resp.text)
                         except Exception:
                             detail = resp.text
+                        _log("CONSENT", f"ERROR {resp.status_code}: {detail}")
                         st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
+                    _log("CONSENT", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
 
@@ -244,6 +300,7 @@ elif page == "Consent":
 # SERVICE ACCESS — Health Insurance Form (3 questions + TTS read-back)
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "Service Access":
+    _log("NAV", "Page: Service Access")
     st.header("Service Access — Health Insurance Form")
     st.markdown("Voice-driven Q&A: answer **3 questions** via speech, then hear a TTS read-back for confirmation.")
 
@@ -301,10 +358,14 @@ elif page == "Service Access":
 
         if st.button("Submit Answer" if lang == "en" else "Wasilisha Jibu"):
             if not citizen_id or not consent_token_id:
+                _log("SERVICE", "VALIDATION FAILED — missing citizen_id or consent_token_id")
                 st.error("Citizen ID and Consent Token ID are required." if lang == "en" else "Kitambulisho cha Raia na Tokeni ya Idhini vinahitajika.")
             elif answer_audio is None:
+                _log("SERVICE", "VALIDATION FAILED — no audio uploaded")
                 st.error("Upload your spoken answer." if lang == "en" else "Pakia jibu lako la sauti.")
             else:
+                _log("SERVICE", f"Q{step+1}/{len(q_list)}: citizen={citizen_id} "
+                     f"audio={answer_audio.name} ({answer_audio.size} bytes)")
                 data = {
                     "citizen_id": citizen_id,
                     "consent_token_id": consent_token_id,
@@ -313,12 +374,17 @@ elif page == "Service Access":
                 files = [("audio_file", ("answer.wav", answer_audio.getvalue(), "audio/wav"))]
                 with st.spinner("Processing..." if lang == "en" else "Inachakatwa..."):
                     try:
+                        t0 = time.time()
                         resp = httpx.post(f"{API}/service-access", data=data, files=files, timeout=120.0)
+                        elapsed = time.time() - t0
+                        _log("SERVICE", f"Response: {resp.status_code} ({elapsed:.1f}s)")
                         if resp.status_code == 200:
                             body = resp.json()
                             field_key = body["field_key"]
                             answer = body["transcribed_answer"]
                             raw = body.get("raw_transcription", answer)
+                            _log("SERVICE", f"Q{step+1} ANSWER: field={field_key} "
+                                 f"answer='{answer}' raw='{raw}'")
 
                             st.session_state["svc_answers"][field_key] = answer
 
@@ -334,12 +400,15 @@ elif page == "Service Access":
                                 detail = resp.json().get("detail", resp.text)
                             except Exception:
                                 detail = resp.text
+                            _log("SERVICE", f"ERROR {resp.status_code}: {detail}")
                             st.error(f"Error {resp.status_code}: {detail}")
                     except httpx.ConnectError:
+                        _log("SERVICE", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                         st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
     else:
         # ── All 3 questions answered — show summary + TTS read-back ──────
+        _log("SERVICE", "All 3 questions answered — showing summary")
         answers = st.session_state["svc_answers"]
         st.subheader("Form Summary" if lang == "en" else "Muhtasari wa Fomu")
 
@@ -350,6 +419,7 @@ elif page == "Service Access":
 
         # Request TTS read-back from backend
         if st.button("Generate Read-back" if lang == "en" else "Tengeneza Muhtasari wa Sauti"):
+            _log("SERVICE", "Requesting TTS read-back summary")
             data = {
                 "citizen_id": citizen_id,
                 "consent_token_id": consent_token_id,
@@ -360,12 +430,17 @@ elif page == "Service Access":
             }
             with st.spinner("Generating summary audio..." if lang == "en" else "Inatengeneza sauti..."):
                 try:
+                    t0 = time.time()
                     resp = httpx.post(f"{API}/service-access/summary", data=data, timeout=60.0)
+                    elapsed = time.time() - t0
+                    _log("SERVICE", f"Summary response: {resp.status_code} ({elapsed:.1f}s)")
                     if resp.status_code == 200:
                         body = resp.json()
+                        _log("SERVICE", f"Summary text: '{body['summary_text'][:80]}...'")
                         st.info(body["summary_text"])
                         audio_path = body.get("audio_url")
                         if audio_path:
+                            _log("SERVICE", f"Summary audio: {audio_path}")
                             try:
                                 st.audio(audio_path)
                             except Exception:
@@ -375,12 +450,15 @@ elif page == "Service Access":
                             detail = resp.json().get("detail", resp.text)
                         except Exception:
                             detail = resp.text
+                        _log("SERVICE", f"Summary ERROR {resp.status_code}: {detail}")
                         st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
+                    _log("SERVICE", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
         # Reset button to start over
         if st.button("Start New Form" if lang == "en" else "Anza Fomu Mpya"):
+            _log("SERVICE", "Resetting form — starting over")
             st.session_state["svc_answers"] = {}
             st.session_state["svc_step"] = 0
             st.rerun()
@@ -390,6 +468,7 @@ elif page == "Service Access":
 # VERIFY IDENTITY (MOSIP e-Signet)
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "Verify Identity (MOSIP)":
+    _log("NAV", "Page: Verify Identity (MOSIP)")
     st.header("Verify Identity via MOSIP e-Signet")
     st.markdown(
         "Authenticate against the **MOSIP national ID system** using biometrics "
@@ -404,17 +483,22 @@ elif page == "Verify Identity (MOSIP)":
     if oidc_code and oidc_state:
         # We've been redirected back from e-Signet with an authorization code.
         # Exchange it for a verified MOSIP identity via the backend callback.
+        _log("MOSIP", f"OIDC callback received: code={oidc_code[:20]}... state={oidc_state[:20]}...")
         st.info("Processing e-Signet callback...")
         try:
+            t0 = time.time()
             resp = httpx.get(
                 f"{API}/mosip/callback",
                 params={"code": oidc_code, "state": oidc_state},
                 timeout=30.0,
             )
+            elapsed = time.time() - t0
+            _log("MOSIP", f"Callback response: {resp.status_code} ({elapsed:.1f}s)")
             if resp.status_code == 200:
                 identity = resp.json()
                 st.session_state["mosip_individual_id"] = identity["mosip_individual_id"]
                 st.session_state["mosip_identity_verified"] = identity["identity_verified"]
+                _log("MOSIP", f"SUCCESS — mosip_id={identity['mosip_individual_id']} verified={identity['identity_verified']}")
                 # Clear query params so a page refresh doesn't re-trigger
                 st.query_params.clear()
                 st.rerun()
@@ -423,9 +507,11 @@ elif page == "Verify Identity (MOSIP)":
                     detail = resp.json().get("detail", resp.text)
                 except Exception:
                     detail = resp.text
+                _log("MOSIP", f"Callback ERROR {resp.status_code}: {detail}")
                 st.error(f"e-Signet callback failed ({resp.status_code}): {detail}")
                 st.query_params.clear()
         except httpx.ConnectError:
+            _log("MOSIP", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
             st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
     # ── Show current verification status ────────────────────────────────
@@ -446,9 +532,12 @@ elif page == "Verify Identity (MOSIP)":
         )
         if st.button("Link Identity"):
             if not link_citizen_id:
+                _log("MOSIP", "VALIDATION FAILED — no citizen_id for linking")
                 st.error("Enter a Citizen ID to link.")
             else:
+                _log("MOSIP", f"Linking MOSIP identity to citizen {link_citizen_id}")
                 try:
+                    t0 = time.time()
                     resp = httpx.post(
                         f"{API}/mosip/link",
                         json={
@@ -457,8 +546,11 @@ elif page == "Verify Identity (MOSIP)":
                         },
                         timeout=30.0,
                     )
+                    elapsed = time.time() - t0
+                    _log("MOSIP", f"Link response: {resp.status_code} ({elapsed:.1f}s)")
                     if resp.status_code == 200:
                         body = resp.json()
+                        _log("MOSIP", f"SUCCESS — linked to citizen {body['citizen_id']}")
                         st.success(f"Identity linked to citizen {body['citizen_id']}!")
                         st.json(body)
                     else:
@@ -466,13 +558,16 @@ elif page == "Verify Identity (MOSIP)":
                             detail = resp.json().get("detail", resp.text)
                         except Exception:
                             detail = resp.text
+                        _log("MOSIP", f"Link ERROR {resp.status_code}: {detail}")
                         st.error(f"Error {resp.status_code}: {detail}")
                 except httpx.ConnectError:
+                    _log("MOSIP", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                     st.error(f"Cannot connect to backend at {BACKEND_URL}.")
 
         # ── Clear verification ──────────────────────────────────────────
         st.markdown("---")
         if st.button("Clear Verification"):
+            _log("MOSIP", "Clearing MOSIP verification from session")
             del st.session_state["mosip_individual_id"]
             if "mosip_identity_verified" in st.session_state:
                 del st.session_state["mosip_identity_verified"]
@@ -482,11 +577,16 @@ elif page == "Verify Identity (MOSIP)":
         # ── Initiate e-Signet OIDC flow ─────────────────────────────────
         st.markdown("Click below to verify your identity via MOSIP e-Signet.")
         if st.button("Verify with MOSIP"):
+            _log("MOSIP", "Initiating e-Signet OIDC authorization")
             try:
+                t0 = time.time()
                 resp = httpx.get(f"{API}/mosip/authorize", timeout=10.0)
+                elapsed = time.time() - t0
+                _log("MOSIP", f"Authorize response: {resp.status_code} ({elapsed:.1f}s)")
                 if resp.status_code == 200:
                     body = resp.json()
                     st.session_state["mosip_oidc_state"] = body["state"]
+                    _log("MOSIP", f"Authorize URL generated — state={body['state'][:20]}...")
                     st.markdown(
                         f'<a href="{body["authorize_url"]}" target="_self">'
                         f'<button style="background-color:#4CAF50;color:white;'
@@ -496,6 +596,8 @@ elif page == "Verify Identity (MOSIP)":
                         unsafe_allow_html=True,
                     )
                 else:
+                    _log("MOSIP", f"Authorize ERROR {resp.status_code}: {resp.text}")
                     st.error(f"Error {resp.status_code}: {resp.text}")
             except httpx.ConnectError:
+                _log("MOSIP", f"CONNECTION ERROR — cannot reach {BACKEND_URL}")
                 st.error(f"Cannot connect to backend at {BACKEND_URL}.")

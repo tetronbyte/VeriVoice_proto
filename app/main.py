@@ -1,8 +1,19 @@
+import logging
+
 from fastapi import FastAPI
 
 from app.config import settings
 from app.routers import authentication, consent, enrollment, mosip, service
 from twilio_integration.webhook_handler import router as twilio_router
+
+# ── Configure VeriVoice logging ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(name)-22s  %(levelname)-5s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Ensure all verivoice.* loggers propagate to root at INFO level
+logging.getLogger("verivoice").setLevel(logging.INFO)
 
 app = FastAPI(title="VeriVoice", version="0.1.0")
 
