@@ -8,10 +8,15 @@ import soundfile as sf
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+import redis
+from sqlalchemy.exc import IntegrityError
+
 from app.config import settings
-from app.db.crud import create_citizen, create_voice_template, get_citizen_by_national_id
+from app.db.crud import create_citizen, create_voice_template, get_citizen_by_mosip_id, get_citizen_by_national_id
 from app.db.database import get_db
 from app.schemas.enrollment import EnrollmentResponse
+
+_redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 from app.services.audio_preprocessor import AudioPreprocessor
 from app.services.embedding_service import EmbeddingService
 from app.services.encryption_service import EncryptionService
@@ -27,6 +32,7 @@ async def enroll(
     national_id_number: str = Form(...),
     preferred_language: str = Form(default="en"),
     phone_number: str = Form(...),
+    mosip_individual_id: str = Form(default=None),
     audio_files: list[UploadFile] = [],
     db: Session = Depends(get_db),
 ):
@@ -34,6 +40,10 @@ async def enroll(
 
     Pipeline: create citizen → preprocess 5 audios → extract 5 embeddings →
     compute centroid → Paillier HE encrypt → store voice template.
+
+    If mosip_individual_id is provided, verifies it was obtained from a
+    valid e-Signet callback (checked via Redis) and creates the citizen
+    with identity_verified=True.
     """
     # ── Validate audio count ─────────────────────────────────────────────
     if len(audio_files) != settings.ENROLLMENT_PHRASES:
@@ -49,13 +59,44 @@ async def enroll(
             detail=f"National ID '{national_id_number}' is already enrolled",
         )
 
+    # ── Resolve identity verification ────────────────────────────────────
+    identity_verified = False
+    if mosip_individual_id:
+        # Verify this MOSIP ID was recently validated via e-Signet callback
+        redis_key = f"esignet:verified:{mosip_individual_id}"
+        if not _redis_client.get(redis_key):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired MOSIP identity session. "
+                "Complete e-Signet verification before enrolling.",
+            )
+        # Consume the verification token (one-time use)
+        _redis_client.delete(redis_key)
+
+        # Check for duplicate MOSIP ID
+        if get_citizen_by_mosip_id(db, mosip_individual_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="This MOSIP individual_id is already linked to another citizen",
+            )
+        identity_verified = True
+
     # ── Create citizen record ────────────────────────────────────────────
-    citizen = create_citizen(
-        db,
-        national_id_number=national_id_number,
-        preferred_language=preferred_language,
-        phone_number=phone_number,
-    )
+    try:
+        citizen = create_citizen(
+            db,
+            national_id_number=national_id_number,
+            preferred_language=preferred_language,
+            phone_number=phone_number,
+            mosip_individual_id=mosip_individual_id,
+            identity_verified=identity_verified,
+        )
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="This MOSIP individual_id is already linked to another citizen",
+        )
 
     # ── Process each audio file ──────────────────────────────────────────
     embedding_service = EmbeddingService()
@@ -99,4 +140,5 @@ async def enroll(
         enrolled_at=citizen.enrolled_at,
         template_id=template.template_id,
         status="enrolled",
+        identity_verified=citizen.identity_verified,
     )

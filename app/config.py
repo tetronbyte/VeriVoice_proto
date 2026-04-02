@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # Enrollment
     ENROLLMENT_PHRASES: int = 5
 
+    # MOSIP e-Signet (OIDC)
+    ESIGNET_BASE_URL: str = ""
+    ESIGNET_CLIENT_ID: str = ""
+    ESIGNET_CLIENT_SECRET: str = ""
+    ESIGNET_REDIRECT_URI: str = "http://localhost:8000/api/v1/mosip/callback"
+    ESIGNET_JWKS_URI: str = ""
+    ESIGNET_SCOPES: str = "openid profile"
+
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 

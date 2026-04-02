@@ -23,7 +23,8 @@ This guide covers how to set up, configure, and use the VeriVoice Interactive Vo
 10. [Webhook Endpoint Reference](#10-webhook-endpoint-reference)
 11. [IVR State Machine](#11-ivr-state-machine)
 12. [Testing the IVR Locally](#12-testing-the-ivr-locally)
-13. [Troubleshooting](#13-troubleshooting)
+13. [Testing MOSIP Identity Verification with IVR](#13-testing-mosip-identity-verification-with-ivr)
+14. [Troubleshooting](#14-troubleshooting)
 
 ---
 
@@ -34,6 +35,8 @@ This guide covers how to set up, configure, and use the VeriVoice Interactive Vo
 - A Twilio phone number with **Voice** capability
 - [ngrok](https://ngrok.com/) installed (for local development)
 - VeriVoice backend running locally on port 8000
+- Redis running locally (for challenge phrase sessions and OIDC state)
+- (Optional) Java 11+ for MOSIP Mock MDS if testing identity-verified enrollment via IVR
 
 ## 2. Twilio Account Setup
 
@@ -83,6 +86,24 @@ TWILIO_PHONE_NUMBER=+1234567890
 ```
 
 The app reads these via `app/config.py`. When `TWILIO_AUTH_TOKEN` is set, all incoming webhook requests are validated against Twilio's `X-Twilio-Signature` header. Leave it blank during initial local testing to skip validation.
+
+### MOSIP e-Signet (Optional)
+
+If you want to test identity-verified enrollment via the IVR (where a citizen's identity is verified against the MOSIP national ID system before voice enrollment), also add:
+
+```env
+# MOSIP e-Signet (OIDC)
+ESIGNET_BASE_URL=https://esignet.collab.mosip.net
+ESIGNET_CLIENT_ID=your_client_id
+ESIGNET_CLIENT_SECRET=your_client_secret
+ESIGNET_REDIRECT_URI=http://localhost:8000/api/v1/mosip/callback
+ESIGNET_JWKS_URI=https://esignet.collab.mosip.net/.well-known/jwks.json
+ESIGNET_SCOPES=openid profile
+```
+
+And start the MOSIP Mock MDS services (see README.md for commands). The Mock MDS simulates biometric capture devices (fingerprint, iris, face) on localhost ports 4501-4600 so that e-Signet can perform biometric authentication without real hardware.
+
+> **Note:** MOSIP identity verification is primarily used via the Streamlit web UI or direct API calls. The IVR flow currently supports voice-only enrollment without MOSIP verification. Integrating MOSIP into the IVR flow would require a web-based pre-verification step before the caller dials in.
 
 ## 5. Exposing Your Local Server (ngrok)
 
@@ -184,6 +205,7 @@ Server returns <Say> + <Record> TwiML
     v
 1. Twilio plays the question via TTS
     |  "Please say your full name."
+    |  "Press pound when you are done."
     v
 2. A beep plays (playBeep="true")
     |  This signals: "start speaking now"
@@ -191,24 +213,20 @@ Server returns <Say> + <Record> TwiML
 3. Caller speaks their answer
     |  "Amina Juma Ochieng"
     v
-4. Recording ENDS automatically — one of three triggers:
+4. Recording ENDS when the caller presses # on the keypad:
     |
-    |── (a) SILENCE DETECTION (most common)
-    |       Twilio detects ~5 seconds of silence after the
-    |       caller stops talking and ends the recording.
-    |       The caller does NOT need to press any button.
+    |── (a) KEYPRESS — # (primary method)
+    |       The caller presses # on their phone keypad
+    |       to signal "I'm done speaking." This gives the
+    |       caller explicit control over when recording stops.
+    |       Silence detection is DISABLED (timeout=0) so the
+    |       recording will NOT auto-stop on pauses.
     |
-    |── (b) MAX LENGTH HIT
+    |── (b) MAX LENGTH HIT (safety fallback)
     |       The recording hard-stops at maxLength seconds
-    |       (we use 15s for form answers, 10s for enrollment).
-    |       Prevents runaway recordings.
-    |
-    |── (c) KEYPRESS — # (optional fallback)
-    |       By default, pressing # on the keypad ends the
-    |       recording early (Twilio's default finishOnKey="#").
-    |       Most callers won't need this — silence detection
-    |       handles it — but it's there if they want to
-    |       explicitly signal "I'm done".
+    |       (15s for form answers, 10s for enrollment, 5s for
+    |       confirmation). Prevents runaway recordings if the
+    |       caller forgets to press #.
     |
     v
 5. trim="trim-silence" strips leading/trailing silence
@@ -225,21 +243,22 @@ Server returns <Say> + <Record> TwiML
 
 The caller simply:
 1. **Hears the question** (TTS)
-2. **Hears a beep**
-3. **Speaks their answer**
-4. **Goes silent** — the system automatically picks up that they're done
+2. **Hears "Press pound when you are done"**
+3. **Hears a beep** — recording starts
+4. **Speaks their answer**
+5. **Presses # on the keypad** — recording stops and is submitted
 
-There is no "press a button to submit your answer" step. This is critical for accessibility — VeriVoice targets users who may not be familiar with complex phone menu interactions. The IVR is designed so that **speaking and going silent is all you need to do**.
+Silence detection is disabled (`timeout=0`) so the caller can pause, think, or take their time without the recording cutting out mid-sentence. This is important for names, addresses, and facility names where callers may pause between words. The `#` keypress gives the caller explicit, predictable control.
 
 ### Recording parameters we use
 
 | Parameter | Value | Why |
 |---|---|---|
-| `maxLength` | 10–15s | Long enough for names/addresses, short enough to prevent dead air |
+| `maxLength` | 5–15s | 15s for form answers, 10s for enrollment/auth/consent, 5s for confirmation |
 | `playBeep` | `true` | Clear audio cue that the system is listening |
 | `trim` | `trim-silence` | Removes silence padding so Whisper gets clean audio |
-| `finishOnKey` | `#` (default) | Implicit fallback — caller can press # to end early |
-| `timeout` | 5s (default) | Seconds of silence before Twilio auto-stops recording |
+| `finishOnKey` | `#` | Caller presses # to stop recording (primary stop method) |
+| `timeout` | `0` (disabled) | Silence detection is OFF — recording only stops on # or maxLength |
 
 ### Important: RecordingUrl authentication
 
@@ -299,6 +318,8 @@ The system redirects Amina to the enrollment flow.
 
 Enrollment collects **5 voice samples** to build a voiceprint. The system also collects the caller's national ID number via keypad input.
 
+> **MOSIP Integration Note:** In the web UI (Streamlit), citizens can optionally verify their identity via MOSIP e-Signet before enrollment, which sets `identity_verified=True` on their citizen record. The IVR flow uses manual national ID entry (keypad) and sets `identity_verified=False`. Both paths create valid voice enrollments — the MOSIP verification adds a stronger identity anchor but is not required.
+
 **Step 4 — Enter national ID**
 
 Twilio POSTs to: `POST /twilio/voice/enroll?lang=en&step=0`
@@ -315,7 +336,7 @@ Twilio POSTs to: `POST /twilio/voice/enroll?lang=en&step=1` with `Digits=2938475
 The system plays:
 > "Please say: The sun rises over the mountain every morning."
 
-*\[Beep\]* — Amina speaks the phrase. She finishes and goes silent. After ~5 seconds of silence, Twilio automatically ends the recording and POSTs the `RecordingUrl` to the callback.
+*\[Beep\]* — Amina speaks the phrase. She finishes and presses **#** on her keypad. Twilio ends the recording and POSTs the `RecordingUrl` to the callback.
 
 **Step 6 — Recording callback (sample 1 saved)**
 
@@ -329,7 +350,7 @@ The same prompt-record-callback cycle repeats for each remaining phrase. Each ti
 1. System plays the phrase via `<Say>`
 2. *\[Beep\]* plays
 3. Amina speaks the phrase
-4. She goes silent — Twilio auto-ends the recording
+4. She presses **#** — Twilio ends the recording
 5. Callback fires, system advances to the next sample
 
 | Sample | Phrase |
@@ -374,7 +395,7 @@ The backend generates a random challenge phrase from the pool:
 
 A `challenge_id` (UUID) is generated and stored in memory.
 
-*\[Beep\]* — Amina speaks the phrase. She finishes and goes silent. Twilio detects the silence, ends the recording, and POSTs the `RecordingUrl` to the callback.
+*\[Beep\]* — Amina speaks the phrase. She presses **#** on her keypad. Twilio ends the recording and POSTs the `RecordingUrl` to the callback.
 
 **Step 2 — Authentication callback**
 
@@ -429,7 +450,7 @@ Twilio POSTs to: `POST /twilio/voice/consent?lang=en`
 The system reads the consent statement:
 > "I consent to share my health records with the Ministry of Health. Say Yes to agree."
 
-*\[Beep\]* — Amina says "Yes, I agree." She goes silent, Twilio auto-ends the recording.
+*\[Beep\]* — Amina says "Yes, I agree." She presses **#**. Twilio ends the recording.
 
 **Step 2 — Consent callback**
 
@@ -459,7 +480,7 @@ Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=0`
 
 > "Please say your full name."
 
-*\[Beep\]* — Amina says: "Amina Juma Ochieng." She stops speaking. After ~5 seconds of silence, Twilio automatically ends the recording and fires the callback.
+*\[Beep\]* — Amina says: "Amina Juma Ochieng." She presses **#**. Twilio ends the recording and fires the callback.
 
 > **Why this question:** This is the strongest demo moment. Amina just authenticated via voiceprint, and now the system captures structured data from her speech. It shows Whisper ASR working on names — especially African names, which are non-trivial for speech recognition.
 
@@ -475,7 +496,7 @@ Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=1`
 
 > "How many dependants would you like to register?"
 
-*\[Beep\]* — Amina says: "Three." She goes silent, recording ends automatically.
+*\[Beep\]* — Amina says: "Three." She presses **#**. Recording ends.
 
 > **Why this question:** Shows the system handles different response types. When Whisper transcribes "three", the backend parses it to the number `3`. Works for both English ("three" -> 3) and Swahili ("tatu" -> 3). Proves the pipeline works beyond just capturing strings.
 
@@ -489,7 +510,7 @@ Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=2`
 
 > "Which hospital or health centre would you like as your primary facility?"
 
-*\[Beep\]* — Amina says: "Kenyatta National Hospital." She goes silent, recording ends automatically.
+*\[Beep\]* — Amina says: "Kenyatta National Hospital." She presses **#**. Recording ends.
 
 > **Why this question:** This is the showstopper for the demo. It's a real-world question from actual health insurance enrollment (e.g., NHIF in Kenya). The answer is a proper noun (facility name), and it demonstrates Whisper handling longer, more complex spoken responses. When demoing in Swahili, this question is especially impressive.
 
@@ -505,7 +526,7 @@ The system generates a TTS read-back of all collected answers:
 
 > "Thank you. I have recorded: your name is Amina Juma Ochieng, you have 3 dependants, and your preferred facility is Kenyatta National Hospital. Is this correct?"
 
-*\[Beep\]* — Amina says: "Yes." She goes silent, recording ends automatically.
+*\[Beep\]* — Amina says: "Yes." She presses **#**. Recording ends.
 
 **Step 8 — Confirmation**
 
@@ -558,6 +579,18 @@ All endpoints are mounted under the `/twilio` prefix and return TwiML XML.
 | `/twilio/voice/service/callback` | POST | Process form answer, advance to next question | `RecordingUrl` (form), `lang`, `question_index`, `full_name`, `dependants`, `primary_facility` (query) |
 | `/twilio/voice/service/confirm` | POST | Handle yes/no confirmation after read-back | `RecordingUrl` (form), `lang`, `full_name`, `dependants`, `primary_facility` (query) |
 
+### Related REST API Endpoints (Non-IVR)
+
+The following endpoints are used by the Streamlit web UI and direct API callers, not by the Twilio IVR flow:
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/api/v1/mosip/authorize` | GET | Initiate MOSIP e-Signet OIDC identity verification |
+| `/api/v1/mosip/callback` | GET | Handle e-Signet redirect (exchange code for verified MOSIP ID) |
+| `/api/v1/mosip/link` | POST | Link verified MOSIP identity to an existing citizen |
+
+These enable identity-verified enrollment via the web UI. The IVR flow does not currently use MOSIP — callers enroll via keypad national ID entry.
+
 ## 11. IVR State Machine
 
 The IVR uses a stateless design — state is encoded in URL query parameters, not server-side sessions. The `IVRState` enum in `twilio_integration/ivr_flow.py` documents the logical states:
@@ -572,11 +605,11 @@ WELCOME
                         |                     |
                         |                     +-- Enter national ID (#)
                         |                     |
-                        |                     +-- [Beep] Record sample 1 --> [silence] auto-stop
-                        |                     +-- [Beep] Record sample 2 --> [silence] auto-stop
-                        |                     +-- [Beep] Record sample 3 --> [silence] auto-stop
-                        |                     +-- [Beep] Record sample 4 --> [silence] auto-stop
-                        |                     +-- [Beep] Record sample 5 --> [silence] auto-stop
+                        |                     +-- [Beep] Record sample 1 --> presses #
+                        |                     +-- [Beep] Record sample 2 --> presses #
+                        |                     +-- [Beep] Record sample 3 --> presses #
+                        |                     +-- [Beep] Record sample 4 --> presses #
+                        |                     +-- [Beep] Record sample 5 --> presses #
                         |                           |
                         |                           v
                         |                     ENROLL_COMPLETE --> Hangup
@@ -584,14 +617,14 @@ WELCOME
                         +-- (Press 2) --> AUTH_CHALLENGE
                                               |
                                               +-- Play challenge phrase
-                                              +-- [Beep] Record response --> [silence] auto-stop
+                                              +-- [Beep] Record response --> presses #
                                                     |
                                                     v
                                               AUTH_RESULT --> Hangup
                                                     |
                                                     +-- (if granted) --> CONSENT_PROMPT
                                                     |                       |
-                                                    |                       +-- [Beep] Record --> [silence] auto-stop
+                                                    |                       +-- [Beep] Record --> presses #
                                                     |                       |
                                                     |                       v
                                                     |                  CONSENT_RESULT
@@ -600,20 +633,20 @@ WELCOME
                                                     |                  SERVICE_QUESTION (x3)
                                                     |                       |
                                                     |                       +-- Q1: "Full name?"
-                                                    |                       |   [Beep] --> speak --> [silence] auto-stop
+                                                    |                       |   [Beep] --> speak --> presses #
                                                     |                       |
                                                     |                       +-- Q2: "How many dependants?"
-                                                    |                       |   [Beep] --> speak --> [silence] auto-stop
+                                                    |                       |   [Beep] --> speak --> presses #
                                                     |                       |
                                                     |                       +-- Q3: "Which facility?"
-                                                    |                           [Beep] --> speak --> [silence] auto-stop
+                                                    |                           [Beep] --> speak --> presses #
                                                     |                           |
                                                     |                           v
                                                     |                  TTS READ-BACK SUMMARY
                                                     |                  "Your name is X, Y dependants, facility Z.
                                                     |                   Is this correct?"
                                                     |                       |
-                                                    |                       +-- [Beep] --> "Yes" --> [silence] auto-stop
+                                                    |                       +-- [Beep] --> "Yes" --> presses #
                                                     |                       |
                                                     |                       v
                                                     |                  SERVICE_COMPLETE --> Hangup
@@ -629,7 +662,7 @@ WELCOME
 2. Start ngrok: `ngrok http 8000`
 3. Configure the Twilio webhook URL (Section 6)
 4. Call your Twilio number from your phone
-5. Follow the voice prompts — remember, just speak and go silent. No buttons needed for voice responses.
+5. Follow the voice prompts — speak your answer after the beep, then press **#** on the keypad to submit.
 
 ### Option B: Use the Twilio Dev Phone
 
@@ -676,7 +709,178 @@ curl -X POST "http://localhost:8000/twilio/voice/service?lang=sw&question_index=
 3. Each step shows the TwiML returned and any errors
 4. The recording tab shows all captured audio files with playback
 
-## 13. Troubleshooting
+## 13. Testing MOSIP Identity Verification with IVR
+
+MOSIP e-Signet uses a browser-based OpenID Connect flow (citizen is redirected to the e-Signet login page to authenticate via fingerprint/iris/face). This means identity verification **cannot happen mid-phone-call** -- it must be done via the web UI (Streamlit) or direct API calls before or after the IVR enrollment.
+
+The practical pattern is: **verify identity on the web, then enroll via phone** (or vice versa, then link afterwards).
+
+### Scenario A: Verify First, Then Enroll via IVR
+
+This is the recommended flow for a registration agent assisting a citizen in person. The agent verifies identity on a laptop/tablet, then the citizen enrolls their voice by calling the IVR.
+
+**Step 1 -- Start all services (4 terminals)**
+
+```bash
+# Terminal 1: FastAPI backend
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2: Streamlit UI
+streamlit run streamlit_app/app.py --server.port 8501
+
+# Terminal 3: Mock MDS Auth (simulates biometric scanner)
+cd MOSIP_eSignet/collab-mock-mds-auth/target
+java -cp "mock-mds-1.2.1-SNAPSHOT.jar;lib/*" io.mosip.mock.sbi.test.TestMockSBI \
+  "mosip.mock.sbi.device.purpose=Auth" \
+  "mosip.mock.sbi.biometric.type=Biometric Device"
+
+# Terminal 4: ngrok tunnel for Twilio
+ngrok http 8000
+```
+
+**Step 2 -- Verify identity via Streamlit**
+
+1. Open `http://localhost:8501`
+2. Navigate to **Verify Identity (MOSIP)** in the sidebar
+3. Click **Verify with MOSIP**
+4. Click the green **Open MOSIP e-Signet Login** button
+5. On the e-Signet page, authenticate using Mock MDS biometrics (the Mock MDS on port 4502 simulates a fingerprint/iris/face capture)
+6. After successful authentication, e-Signet redirects back to Streamlit
+7. The page shows: **Identity Confirmed** with the verified MOSIP Individual ID
+8. Note the MOSIP ID (e.g., `MOSIP-IND-12345`) -- you'll need it later
+
+**Step 3 -- Enroll the citizen via IVR phone call**
+
+1. Call your Twilio number from the citizen's phone
+2. Press **1** for English, then **1** to enroll
+3. Enter the national ID on the keypad, press **#**
+4. Speak the 5 enrollment phrases (speak, then go silent after each)
+5. Enrollment completes -- the citizen now has a voice template with `identity_verified=False`
+
+**Step 4 -- Link the MOSIP identity to the enrolled citizen**
+
+Back on the Streamlit UI:
+
+1. Navigate to **Verify Identity (MOSIP)** (your verified MOSIP ID is still in the session)
+2. Under **Link to Existing Citizen**, paste the citizen's `citizen_id` (from the enrollment response or database)
+3. Click **Link Identity**
+4. The citizen's record is now updated: `identity_verified=True`, `mosip_individual_id` set
+
+**Verify via cURL:**
+
+```bash
+# Check the citizen record directly
+curl http://localhost:8000/api/v1/mosip/link \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"citizen_id": "<citizen-uuid>", "mosip_individual_id": "MOSIP-IND-12345"}'
+```
+
+### Scenario B: Enroll via IVR First, Verify MOSIP Later
+
+Useful when the registration agent doesn't have MOSIP access at the time of voice enrollment (e.g., field registration in a remote area). The citizen enrolls their voice over the phone, then visits a registration centre later to verify their MOSIP identity.
+
+1. Citizen calls the IVR, enrolls with 5 voice samples (manual national ID entry)
+2. Later, at a registration centre with MOSIP access:
+   - Agent opens Streamlit > **Verify Identity (MOSIP)** > verifies citizen via e-Signet
+   - Agent links the verified MOSIP ID to the citizen's existing record
+3. The citizen's record is upgraded from `identity_verified=False` to `identity_verified=True`
+
+### Scenario C: API-Only Testing (No Streamlit, No Phone)
+
+Test the entire MOSIP + IVR chain via cURL without a browser or phone call.
+
+```bash
+# 1. Initiate MOSIP OIDC (get the authorize URL)
+curl -s http://localhost:8000/api/v1/mosip/authorize | python -m json.tool
+# Returns: {"authorize_url": "https://esignet.collab.mosip.net/...", "state": "abc123"}
+
+# 2. (In a real flow, the citizen would visit the authorize_url in a browser
+#     and authenticate via e-Signet. The callback URL receives code + state.)
+#
+#     For testing, you can mock the callback if e-Signet is not reachable:
+#     The test suite (tests/test_esignet_e2e.py) shows how to mock this.
+
+# 3. After MOSIP verification, enroll with the verified MOSIP ID:
+curl -X POST http://localhost:8000/api/v1/enroll \
+  -F "national_id_number=KE-MOSIP-001" \
+  -F "preferred_language=en" \
+  -F "phone_number=+254700000099" \
+  -F "mosip_individual_id=MOSIP-IND-12345" \
+  -F "audio_files=@sample1.wav" \
+  -F "audio_files=@sample2.wav" \
+  -F "audio_files=@sample3.wav" \
+  -F "audio_files=@sample4.wav" \
+  -F "audio_files=@sample5.wav"
+# Returns: {"citizen_id": "...", "identity_verified": true, ...}
+
+# 4. Authenticate (same as non-MOSIP -- voice pipeline is unchanged)
+curl -s http://localhost:8000/api/v1/challenge?language=en | python -m json.tool
+curl -X POST http://localhost:8000/api/v1/authenticate \
+  -F "citizen_id=<citizen-uuid>" \
+  -F "challenge_phrase_id=<challenge-uuid>" \
+  -F "audio_file=@response.wav"
+
+# 5. The consent token is now linked to a MOSIP-verified citizen
+curl -X POST http://localhost:8000/api/v1/consent \
+  -F "citizen_id=<citizen-uuid>" \
+  -F "ministry_code=MOH" \
+  -F "data_scope=health_records" \
+  -F "audio_file=@consent.wav"
+```
+
+### What Gets Verified in the MOSIP + IVR Chain
+
+```
+Web (Streamlit/API)                    IVR (Twilio phone call)
+==================                     =======================
+
+e-Signet OIDC login                    Citizen dials in
+  |                                      |
+  v                                      v
+MOSIP biometric auth                   Welcome + language select
+(fingerprint/iris/face                   |
+ via Mock MDS in dev)                    v
+  |                                    Enter national ID (#)
+  v                                      |
+Verified MOSIP ID returned               v
+(mosip_individual_id)                  Record 5 voice samples
+  |                                      |
+  |                                      v
+  |                                    Enrollment complete
+  |                                    (identity_verified=False)
+  |                                      |
+  +---------- Link Identity ----------->+
+  |            POST /mosip/link          |
+  v                                      v
+identity_verified = True               Citizen record updated
+mosip_individual_id set                (MOSIP-verified)
+                                         |
+                                         v
+                                       Authenticate, Consent,
+                                       Service Access all work
+                                       with the verified identity
+```
+
+### Automated Testing
+
+The test suite includes a full e2e test that exercises this chain with mocked e-Signet:
+
+```bash
+# Runs OIDC -> enrollment -> auth -> consent -> service access
+# Verifies identity_verified=True persists through the entire chain
+pytest tests/test_esignet_e2e.py -v -s
+```
+
+This test takes ~90 seconds (loads ECAPA-TDNN + Whisper models) and verifies:
+- OIDC state is consumed after callback (no replay)
+- Citizen has `identity_verified=True` and `mosip_individual_id` set
+- Consent token references the MOSIP-verified citizen
+- All Redis `esignet:*` keys are cleaned up
+
+---
+
+## 14. Troubleshooting
 
 | Problem | Cause | Fix |
 |---|---|---|
@@ -684,13 +888,15 @@ curl -X POST "http://localhost:8000/twilio/voice/service?lang=sw&question_index=
 | "Invalid Twilio signature" (403) | `TWILIO_AUTH_TOKEN` is set but the request URL doesn't match | Ensure the ngrok URL in Twilio Console matches exactly (including https) |
 | "No recording received" | Caller hung up before speaking, or Twilio couldn't reach the callback | Check Twilio debugger logs for errors |
 | Recording URL returns 401 | Twilio recordings require authentication to download | Use `httpx` with Twilio Basic Auth: `(ACCOUNT_SID, AUTH_TOKEN)` |
-| Recording ends too early | Caller paused mid-sentence and silence detection kicked in | Increase `timeout` in `<Record>` (default 5s) or advise callers to speak continuously |
+| Recording ends too early | Caller hit maxLength before pressing # | Increase `maxLength` in `<Record>` or remind caller to press # promptly |
 | Recording cuts off long answers | `maxLength` is too short | Increase `maxLength` (currently 15s for form answers, 10s for enrollment) |
 | Caller confused about when to speak | No beep or unclear prompt | Ensure `playBeep="true"` is set; consider adding "speak after the beep" to prompts |
 | Enrollment says complete but no voiceprint stored | Prototype callback doesn't download recordings yet | This is expected in the prototype — the callback flow is wired, but full processing requires production deployment |
 | ngrok URL changed | Free ngrok assigns a new URL on each restart | Update the Twilio webhook URL, or use a paid ngrok plan for a stable subdomain |
 | Swahili TTS sounds like English | The `<Say>` voice is set to `alice` / `en-US` for all languages | For production, switch to a Swahili-capable TTS voice or use gTTS with `<Play>` instead of `<Say>` |
 | Read-back summary has wrong answers | Query parameter encoding issue with special characters in names | URL-encode answer values; check ngrok inspector for the raw query string |
+| MOSIP identity verification not available in IVR | By design -- e-Signet OIDC requires a web browser | Use the Streamlit UI (`/Verify Identity`) to verify via MOSIP before or after IVR enrollment |
+| Redis connection refused | Redis not running or wrong URL | Start Redis (`redis-server`) and check `REDIS_URL` in `.env` |
 
 ---
 
@@ -709,7 +915,7 @@ Amina dials +1234567890
 "Enter your national ID followed by #."              --> Types 29384756#
   |
   v
-"Please say: The sun rises over the mountain..."     --> [Beep] Speaks --> [silence] auto-stop
+"Please say: The sun rises over the mountain..."     --> [Beep] Speaks --> presses #
   |                                                       (x5 phrases)
   v
 "Enrollment complete. Thank you."                    --> Hangup
@@ -720,7 +926,7 @@ Amina dials +1234567890
 Amina calls again, selects English, presses 2
   |
   v
-"Please say: The market opens early on Wednesday."   --> [Beep] Speaks --> [silence] auto-stop
+"Please say: The market opens early on Wednesday."   --> [Beep] Speaks --> presses #
   |
   v
 Voice biometric: 0.87 (pass) + Transcript: 87.5% (pass)
@@ -729,22 +935,22 @@ Voice biometric: 0.87 (pass) + Transcript: 87.5% (pass)
 "Authentication complete."                           --> Redirected to consent
   |
   v
-"I consent to share my health records..."            --> [Beep] "Yes" --> [silence] auto-stop
+"I consent to share my health records..."            --> [Beep] "Yes" --> presses #
   |
   v
 "Your consent has been recorded."                    --> Redirected to service
   |
   v
-"Please say your full name."                         --> [Beep] "Amina Juma Ochieng" --> [silence] auto-stop
+"Please say your full name."                         --> [Beep] "Amina Juma Ochieng" --> presses #
   |
   v
-"How many dependants would you like to register?"    --> [Beep] "Three" --> [silence] auto-stop
+"How many dependants would you like to register?"    --> [Beep] "Three" --> presses #
   |
   v
-"Which hospital or health centre...?"                --> [Beep] "Kenyatta National Hospital" --> [silence] auto-stop
+"Which hospital or health centre...?"                --> [Beep] "Kenyatta National Hospital" --> presses #
   |
   v
-"Thank you. I have recorded: your name is            --> [Beep] "Yes" --> [silence] auto-stop
+"Thank you. I have recorded: your name is            --> [Beep] "Yes" --> presses #
  Amina Juma Ochieng, you have 3 dependants,
  and your preferred facility is Kenyatta
  National Hospital. Is this correct?"

@@ -2,14 +2,15 @@
 
 Privacy-preserving voice authentication and audio consent system for inclusive digital public services in East Africa.
 
-VeriVoice augments existing national ID systems (Kenya's Huduma Namba, Uganda's Ndaga Muntu) with a voice biometric layer, enabling citizens — including those with low literacy — to authenticate and give informed consent using only their voice over a basic phone call.
+VeriVoice augments existing national ID systems (Kenya's Huduma Namba, Uganda's Ndaga Muntu) with a voice biometric layer, enabling citizens — including those with low literacy — to authenticate and give informed consent using only their voice over a basic phone call. Through MOSIP e-Signet integration, VeriVoice can cryptographically verify a citizen's identity against the national ID system before linking their voice biometric.
 
 > **Status:** Prototype / hackathon demo
 
 ## How It Works
 
 ```
-Enrollment:    5 voice samples -> ECAPA-TDNN (192-dim) -> Paillier HE encrypt -> store ciphertext
+Identity:       (optional) MOSIP e-Signet OIDC -> verify citizen via national ID biometrics
+Enrollment:     5 voice samples -> ECAPA-TDNN (192-dim) -> Paillier HE encrypt -> store ciphertext
 Authentication: voice + phrase -> biometric match (HE dot product) + Whisper ASR transcript check
 Consent:        voice auth -> Ed25519 sign consent token -> store in DB
 Service Access: verify consent token -> voice Q&A via Whisper ASR
@@ -22,6 +23,8 @@ Service Access: verify consent token -> voice Q&A via Whisper ASR
 ### Prerequisites
 
 - Python 3.10+
+- Java 11+ (for MOSIP Mock MDS biometric device simulators)
+- Redis (for session/OIDC state management)
 - ~4 GB disk space (for Whisper large-v3 model, downloaded on first use)
 - GPU optional (auto-detects CUDA, falls back to CPU)
 
@@ -64,7 +67,27 @@ curl http://localhost:8000/health
 streamlit run streamlit_app/app.py --server.port 8501
 ```
 
-Open `http://localhost:8501` to access the demo UI with four pages: Enroll, Authenticate, Consent, and Service Access.
+Open `http://localhost:8501` to access the demo UI with five pages: Enroll, Authenticate, Consent, Service Access, and Verify Identity (MOSIP).
+
+### MOSIP Mock MDS (Biometric Device Simulators)
+
+For e-Signet identity verification during development, start the Mock MDS Java services:
+
+```bash
+# Terminal 3: Registration Mock MDS (port 4501)
+cd MOSIP_eSignet/collab-mock-mds-reg/target
+java -cp "classes;lib/*" io.mosip.mock.sbi.test.TestMockSBI \
+  "mosip.mock.sbi.device.purpose=Registration" \
+  "mosip.mock.sbi.biometric.type=Biometric Device"
+
+# Terminal 4: Auth Mock MDS (port 4502)
+cd MOSIP_eSignet/collab-mock-mds-auth/target
+java -cp "mock-mds-1.2.1-SNAPSHOT.jar;lib/*" io.mosip.mock.sbi.test.TestMockSBI \
+  "mosip.mock.sbi.device.purpose=Auth" \
+  "mosip.mock.sbi.biometric.type=Biometric Device"
+```
+
+Verify with: `netstat -ano | findstr :4501`
 
 ## API Endpoints
 
@@ -79,6 +102,9 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 | `/api/v1/consent` | POST | Record verbal consent, get Ed25519 signed token |
 | `/api/v1/service-access` | POST | Voice-driven form Q&A (3 bilingual questions) |
 | `/api/v1/service-access/summary` | POST | TTS read-back summary of form answers |
+| `/api/v1/mosip/authorize` | GET | Initiate MOSIP e-Signet OIDC login (returns redirect URL) |
+| `/api/v1/mosip/callback` | GET | e-Signet OIDC callback (exchanges code for verified identity) |
+| `/api/v1/mosip/link` | POST | Link verified MOSIP identity to existing citizen |
 
 ### Twilio IVR Webhooks
 
@@ -91,6 +117,8 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 | `/twilio/voice/service` | Health insurance form Q&A (3 questions + read-back) |
 | `/twilio/voice/service/confirm` | Yes/no confirmation after TTS summary |
 
+All IVR voice recordings use **keypad # to stop** (silence detection is disabled). The caller hears a beep, speaks, and presses `#` when done. This gives callers explicit control and prevents mid-sentence cutoffs.
+
 Interactive API docs available at `http://localhost:8000/docs` (Swagger UI).
 
 ## Architecture
@@ -100,10 +128,12 @@ Interface Layer     FastAPI routers | Streamlit app | Twilio webhooks
                          |                |               |
 Service Layer       AudioPreprocessor, EmbeddingService, EncryptionService,
                     MatchingService, TranscriptionService, TTSService,
-                    ConsentService, ChallengeService
+                    ConsentService, ChallengeService, MosipService
                          |
 Data Layer          SQLAlchemy ORM + SQLite (CITIZEN, VOICE_TEMPLATE,
                     AUTH_EVENT, CONSENT_TOKEN)
+                         |
+Identity Layer      MOSIP e-Signet (OIDC) + Mock MDS (SBI biometric devices)
                          |
 Config              Pydantic BaseSettings loading from .env
 ```
@@ -140,7 +170,11 @@ Both stages must pass for access to be granted:
 | Homomorphic Encryption | python-paillier (2048-bit Paillier) |
 | Digital Signatures | PyNaCl (Ed25519) |
 | Database | SQLite + SQLAlchemy + Alembic |
+| Identity Provider | MOSIP e-Signet (OpenID Connect) |
+| Mock Biometric Devices | MOSIP Mock MDS (SBI protocol, Java 11+) |
+| OIDC Client | authlib + python-jose (JWT validation) |
 | IVR / Telephony | Twilio Voice API |
+| Session / State | Redis (challenge phrases, OIDC state/nonce) |
 | Demo UI | Streamlit |
 | Audio Processing | librosa, scipy, torchaudio |
 
@@ -150,17 +184,20 @@ Both stages must pass for access to be granted:
 VeriVoice_proto/
 ├── app/
 │   ├── main.py              # FastAPI entry point
-│   ├── config.py             # Pydantic settings (.env)
+│   ├── config.py             # Pydantic settings (.env) including ESIGNET_* config
 │   ├── models/               # SQLAlchemy models (Citizen, VoiceTemplate, AuthEvent, ConsentToken)
-│   ├── schemas/              # Pydantic request/response schemas
-│   ├── routers/              # API route handlers (enroll, authenticate, consent, service)
-│   ├── services/             # Business logic (audio, embedding, encryption, matching, ASR, TTS)
+│   ├── schemas/              # Pydantic schemas (enrollment, auth, consent, mosip)
+│   ├── routers/              # API routes (enroll, authenticate, consent, service, mosip)
+│   ├── services/             # Business logic (audio, embedding, encryption, matching, ASR, TTS, mosip)
 │   ├── db/                   # Database engine, session, CRUD
-│   └── utils/                # Audio helpers, key management
-├── streamlit_app/app.py      # Streamlit demo UI
+│   └── utils/                # Audio helpers, key management, OIDC client
+├── streamlit_app/app.py      # Streamlit demo UI (5 pages incl. MOSIP verification)
 ├── twilio_integration/       # Twilio IVR webhooks + call flow state machine
+├── MOSIP_eSignet/            # MOSIP e-Signet tooling (external, Java)
+│   ├── collab-mock-mds-reg/  # Mock MDS for Registration (SBI device simulator)
+│   └── collab-mock-mds-auth/ # Mock MDS for Auth (SBI device simulator)
 ├── migrations/               # Alembic database migrations
-├── tests/                    # pytest test suite
+├── tests/                    # pytest test suite (incl. MOSIP e2e)
 ├── requirements.txt
 ├── alembic.ini
 ├── .env.example
@@ -184,10 +221,14 @@ pytest tests/test_tts.py -v             # gTTS synthesis
 pytest tests/test_challenge.py -v       # Phrase generation + matching
 pytest tests/test_consent.py -v         # Ed25519 signing
 pytest tests/test_schemas.py -v         # Pydantic validation
-pytest tests/test_enrollment_api.py -v  # Enrollment endpoint
+pytest tests/test_enrollment_api.py -v  # Enrollment endpoint (incl. MOSIP-verified)
 pytest tests/test_auth_api.py -v        # Authentication endpoint
 pytest tests/test_twilio.py -v          # IVR TwiML responses
+pytest tests/test_mosip.py -v           # MosipService (OIDC, JWT, replay protection)
+pytest tests/test_mosip_schemas.py -v   # MOSIP Pydantic schemas
+pytest tests/test_mosip_api.py -v       # MOSIP API endpoints (authorize, callback, link)
 pytest tests/test_e2e.py -v -s          # Full end-to-end flow
+pytest tests/test_esignet_e2e.py -v -s  # Full MOSIP e-Signet + VeriVoice e2e flow
 ```
 
 ## Configuration
@@ -205,6 +246,10 @@ Key parameters:
 | `WHISPER_MODEL` | large-v3 | Whisper ASR model |
 | `ECAPA_SOURCE` | speechbrain/spkrec-ecapa-voxceleb | Speaker embedding model |
 | `ENROLLMENT_PHRASES` | 5 | Number of voice samples for enrollment |
+| `ESIGNET_BASE_URL` | *(env)* | MOSIP e-Signet server URL |
+| `ESIGNET_CLIENT_ID` | *(env)* | OIDC client ID registered with e-Signet |
+| `ESIGNET_REDIRECT_URI` | `http://localhost:8000/api/v1/mosip/callback` | OIDC callback URL |
+| `ESIGNET_SCOPES` | `openid profile` | OIDC scopes |
 
 ## Twilio Setup (IVR)
 
@@ -221,8 +266,62 @@ To test the phone-based IVR flow:
 - **Paillier HE** — voice matching computed on encrypted data (2048-bit keys)
 - **Ed25519** — consent tokens cryptographically signed for integrity and non-repudiation
 - **Twilio request validation** — webhook endpoints verify `X-Twilio-Signature` when auth token is configured
+- **MOSIP e-Signet OIDC** — JWT validation (RS256 signature via JWKS, expiry, audience, issuer, nonce)
+- **OIDC replay protection** — state/nonce stored in Redis with 5-min TTL, consumed atomically (GETDEL) on callback
+- **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.2.0 (2026-04-02)
+
+**New Features**
+- **MOSIP e-Signet OIDC integration** -- Citizens can verify their identity against the MOSIP national ID system via OpenID Connect before or after voice enrollment. Uses biometric authentication (fingerprint/iris/face) through e-Signet, with Mock MDS device simulators for development (`app/services/mosip_service.py`, `app/routers/mosip.py`)
+- **Identity-verified enrollment** -- `POST /api/v1/enroll` now accepts optional `mosip_individual_id` from a prior e-Signet callback. If provided and valid (checked via Redis), the citizen is created with `identity_verified=True` (`app/routers/enrollment.py`)
+- **3 new MOSIP API endpoints** -- `GET /api/v1/mosip/authorize` (initiate OIDC), `GET /api/v1/mosip/callback` (exchange code for verified identity), `POST /api/v1/mosip/link` (link MOSIP identity to existing citizen) (`app/routers/mosip.py`)
+- **OIDC replay protection** -- State/nonce stored in Redis with 5-min TTL, consumed atomically via GETDEL on callback. Verification tokens are single-use (`app/services/mosip_service.py`)
+- **Streamlit MOSIP verification page** -- New "Verify Identity (MOSIP)" page with e-Signet redirect flow, callback handling via `st.query_params`, identity linking, and session persistence across pages (`streamlit_app/app.py`)
+- **MOSIP verification badges** -- Enroll and Authenticate page headers show "MOSIP Verified" or "Unverified" status; sidebar displays verified MOSIP ID (`streamlit_app/app.py`)
+- **MOSIP-aware enrollment toggle** -- When a MOSIP identity is verified in the session, the Enroll page shows "Use Verified MOSIP Identity for Enrollment" toggle (`streamlit_app/app.py`)
+- **MOSIP Mock MDS tooling** -- Pre-built Java services for simulating biometric capture devices (SBI protocol) during development. Registration MDS (port 4501) and Auth MDS (port 4502) (`MOSIP_eSignet/`)
+- **IVR keypad-stop recordings** -- Replaced silence-based auto-stop with explicit `#` keypress to end recordings (`timeout=0`, `finishOnKey=#`). Adds bilingual "Press pound when you are done" / "Bonyeza # ukimaliza" prompt before every recording. Prevents mid-sentence cutoffs from pauses (`twilio_integration/webhook_handler.py`)
+- **Twilio Dev Phone** -- Added Twilio Dev Phone tooling for browser-based IVR testing without a physical phone (`dev-phone/`)
+
+**Schema/DB Changes**
+- `CITIZEN` table: added `mosip_individual_id` (VARCHAR, unique, nullable) and `identity_verified` (BOOLEAN, default False) via Alembic migration `d82f872e1b6f`
+- `EnrollmentRequest`: added optional `mosip_individual_id` field
+- `EnrollmentResponse`: added `identity_verified` boolean field
+- New `app/schemas/mosip.py`: `MosipAuthorizeResponse`, `MosipCallbackRequest`, `MosipIdentityResponse`, `MosipLinkRequest`, `MosipLinkResponse`
+
+**New Dependencies**
+- `authlib` -- OIDC client for e-Signet authorization code flow
+- `python-jose[cryptography]` -- JWT validation (RS256 signature, JWKS)
+
+**Files Changed/Added**
+| File | Change |
+|---|---|
+| `app/config.py` | Added 6 `ESIGNET_*` settings |
+| `app/models/citizen.py` | Added `mosip_individual_id`, `identity_verified` columns |
+| `app/db/crud.py` | Added `link_mosip_identity()`, `get_citizen_by_mosip_id()`, updated `create_citizen()` |
+| `app/services/mosip_service.py` | New -- MosipService (OIDC authorize, token exchange, JWT validation, Redis state) |
+| `app/schemas/mosip.py` | New -- 5 Pydantic schemas for MOSIP endpoints |
+| `app/routers/mosip.py` | New -- 3 endpoints (authorize, callback, link) |
+| `app/routers/enrollment.py` | Extended with optional `mosip_individual_id` + Redis verification check |
+| `app/schemas/enrollment.py` | Added `mosip_individual_id` (request), `identity_verified` (response) |
+| `app/utils/oidc.py` | New -- Authlib AsyncOAuth2Client factory |
+| `app/main.py` | Registered MOSIP router |
+| `streamlit_app/app.py` | Added MOSIP verification page, enrollment toggle, badges |
+| `.env.example` | Added `ESIGNET_*` configuration keys |
+| `requirements.txt` | Added `authlib`, `python-jose[cryptography]` |
+| `MOSIP_eSignet/` | New -- Mock MDS Registration + Auth (pre-built Java) |
+| `migrations/versions/d82f872e1b6f_*` | New -- Alembic migration for MOSIP columns |
+| `tests/test_mosip.py` | New -- 15 tests (OIDC, JWT validation, replay protection) |
+| `tests/test_mosip_schemas.py` | New -- 17 tests (schema validation) |
+| `tests/test_mosip_api.py` | New -- 10 tests (API endpoints, full authorize->callback->link flow) |
+| `tests/test_esignet_e2e.py` | New -- Full MOSIP + VeriVoice e2e test (OIDC->enroll->auth->consent->service) |
+| `tests/test_db.py` | Added 6 MOSIP identity linking tests |
+| `tests/test_enrollment_api.py` | Added 5 MOSIP-verified enrollment tests |
+| `twilio_integration/webhook_handler.py` | All 5 Record calls: `timeout=0`, `finishOnKey=#`, bilingual stop prompt |
+| `dev-phone/` | New -- Twilio Dev Phone for browser-based IVR testing |
 
 ### v1.1.0 (2026-03-31)
 

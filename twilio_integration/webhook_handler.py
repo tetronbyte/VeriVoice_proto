@@ -176,12 +176,18 @@ async def enroll_prompt(
     prompt_text = prompts[step]
 
     response.say(prompt_text, voice="alice")
+    if lang == "sw":
+        response.say("Bonyeza # ukimaliza.", voice="alice")
+    else:
+        response.say("Press pound when you are done.", voice="alice")
     response.record(
         max_length=10,
         action=f"/twilio/voice/enroll/callback?lang={lang}&step={step}&national_id={nid}",
         method="POST",
         play_beep=True,
         trim="trim-silence",
+        timeout=0,
+        finish_on_key="#",
     )
     return _twiml_response(response)
 
@@ -235,8 +241,10 @@ async def authenticate_prompt(
 
     if lang == "sw":
         response.say(f"Tafadhali sema: {phrase}", voice="alice")
+        response.say("Bonyeza # ukimaliza.", voice="alice")
     else:
         response.say(f"Please say the following phrase: {phrase}", voice="alice")
+        response.say("Press pound when you are done.", voice="alice")
 
     response.record(
         max_length=10,
@@ -244,6 +252,8 @@ async def authenticate_prompt(
         method="POST",
         play_beep=True,
         trim="trim-silence",
+        timeout=0,
+        finish_on_key="#",
     )
     return _twiml_response(response)
 
@@ -295,12 +305,18 @@ async def consent_prompt(
         consent_text = "I consent to share my health records with the Ministry of Health. Say Yes to agree."
 
     response.say(consent_text, voice="alice")
+    if lang == "sw":
+        response.say("Bonyeza # ukimaliza.", voice="alice")
+    else:
+        response.say("Press pound when you are done.", voice="alice")
     response.record(
         max_length=10,
         action=f"/twilio/voice/consent/callback?lang={lang}",
         method="POST",
         play_beep=True,
         trim="trim-silence",
+        timeout=0,
+        finish_on_key="#",
     )
     return _twiml_response(response)
 
@@ -374,6 +390,10 @@ async def service_prompt(
         response.say(summary, voice="alice")
 
         # Record confirmation (yes/no)
+        if lang == "sw":
+            response.say("Bonyeza # ukimaliza.", voice="alice")
+        else:
+            response.say("Press pound when you are done.", voice="alice")
         response.record(
             max_length=5,
             action=(
@@ -384,10 +404,16 @@ async def service_prompt(
             method="POST",
             play_beep=True,
             trim="trim-silence",
+            timeout=0,
+            finish_on_key="#",
         )
         return _twiml_response(response)
 
     response.say(q_list[question_index], voice="alice")
+    if lang == "sw":
+        response.say("Bonyeza # ukimaliza.", voice="alice")
+    else:
+        response.say("Press pound when you are done.", voice="alice")
     response.record(
         max_length=15,
         action=(
@@ -399,6 +425,8 @@ async def service_prompt(
         method="POST",
         play_beep=True,
         trim="trim-silence",
+        timeout=0,
+        finish_on_key="#",
     )
     return _twiml_response(response)
 

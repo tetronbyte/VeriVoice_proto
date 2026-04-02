@@ -5,6 +5,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.database import Base
+from sqlalchemy.exc import IntegrityError
+
 from app.db.crud import (
     create_auth_event,
     create_citizen,
@@ -12,8 +14,10 @@ from app.db.crud import (
     create_voice_template,
     get_active_template,
     get_citizen_by_id,
+    get_citizen_by_mosip_id,
     get_citizen_by_national_id,
     get_consent_token,
+    link_mosip_identity,
     revoke_consent_token,
 )
 
@@ -55,6 +59,39 @@ class TestCitizen:
     def test_nonexistent_citizen_returns_none(self, db):
         assert get_citizen_by_id(db, "no-such-id") is None
         assert get_citizen_by_national_id(db, "no-such-nid") is None
+
+    def test_new_citizen_identity_not_verified(self, db):
+        citizen = create_citizen(db, national_id_number="KE-MOSIP1", phone_number="+254700000050")
+        assert citizen.identity_verified is False
+        assert citizen.mosip_individual_id is None
+
+    def test_link_mosip_identity(self, db):
+        citizen = create_citizen(db, national_id_number="KE-MOSIP2", phone_number="+254700000051")
+        assert citizen.identity_verified is False
+
+        linked = link_mosip_identity(db, citizen.citizen_id, "MOSIP-IND-001")
+        assert linked.identity_verified is True
+        assert linked.mosip_individual_id == "MOSIP-IND-001"
+
+        # Verify lookup by MOSIP ID works
+        fetched = get_citizen_by_mosip_id(db, "MOSIP-IND-001")
+        assert fetched is not None
+        assert fetched.citizen_id == citizen.citizen_id
+
+    def test_duplicate_mosip_id_raises_integrity_error(self, db):
+        c1 = create_citizen(db, national_id_number="KE-MOSIP3", phone_number="+254700000052")
+        c2 = create_citizen(db, national_id_number="KE-MOSIP4", phone_number="+254700000053")
+
+        link_mosip_identity(db, c1.citizen_id, "MOSIP-IND-DUP")
+        with pytest.raises(IntegrityError):
+            link_mosip_identity(db, c2.citizen_id, "MOSIP-IND-DUP")
+
+    def test_get_citizen_by_mosip_id_not_found(self, db):
+        assert get_citizen_by_mosip_id(db, "MOSIP-NONEXISTENT") is None
+
+    def test_link_mosip_nonexistent_citizen_raises(self, db):
+        with pytest.raises(ValueError):
+            link_mosip_identity(db, "no-such-citizen", "MOSIP-IND-999")
 
 
 # ── VoiceTemplate ────────────────────────────────────────────────────────────

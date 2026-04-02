@@ -21,6 +21,8 @@ sounddevice
 redis
 streamlit
 httpx
+authlib
+python-jose[cryptography]
 twilio
 transformers
 unidecode

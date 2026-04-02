@@ -8,9 +8,9 @@ Infrastructure for Inclusive Digital Public Services
 
 Prototype Stage
 
-Document Version: 1.0
+Document Version: 1.1
 
-Date: March 2026
+Date: April 2026
 
 1\. Executive Summary
 
@@ -30,7 +30,12 @@ infrastructure layer designed to solve these problems without replacing
 existing national identity systems. Rather than building a parallel
 identity framework, VeriVoice augments proven DPI rails (Kenya's Huduma
 Namba, Uganda's Ndaga Muntu) by anchoring a governed voice biometric
-layer to the existing national ID as its single source of truth.
+layer to the existing national ID as its single source of truth. Through
+integration with MOSIP e-Signet (an OpenID Connect identity provider
+built on the MOSIP national ID platform), VeriVoice can cryptographically
+verify a citizen's identity against the national ID system before linking
+their voice biometric — replacing manual ID entry with federated,
+biometric-verified identity anchoring.
 
 During enrollment, voice samples are converted into encrypted
 mathematical voice templates (never storing raw audio), preserving
@@ -58,7 +63,12 @@ VeriVoice enhances the security and inclusivity of existing Digital ID
 registries by adding a governed, privacy-preserving voice authentication
 and consent layer anchored to the national ID. Voice functions as an
 optional authentication and consent interface cryptographically bound to
-an existing ID number in the national registry.
+an existing ID number in the national registry. With MOSIP e-Signet
+integration, the identity anchor is no longer a self-reported national ID
+number — it is a cryptographically verified identity obtained through
+MOSIP's OpenID Connect flow, where the citizen authenticates via
+traditional biometrics (fingerprint, iris, or face) against the national
+ID system before their voice biometric is enrolled.
 
 3.1 Core Value Proposition
 
@@ -95,17 +105,43 @@ an existing ID number in the national registry.
     with the system through voice instructions so I can use digital
     services without reading complex text interfaces."
 
+-   **Registration Agent (MOSIP):** "As a registration agent, I want to
+    verify a citizen's identity against the national ID system using MOSIP
+    e-Signet before enrolling their voice, so I can be sure the voice
+    biometric is anchored to a verified identity rather than a
+    self-reported ID number."
+
 5\. System Use Cases
 
 5.1 Voice Enrollment (One-Time Registration)
 
 A citizen enrols their voice through an assisted registration centre.
-Their national ID is manually entered (prototype; no live registry
-call). A set of 5 spoken phrases are recorded. The system converts each
+Identity is established in one of two ways: (a) manual national ID entry
+(legacy flow), or (b) MOSIP e-Signet identity verification, where the
+citizen authenticates via MOSIP biometrics (fingerprint/iris/face) through
+an OIDC flow and receives a cryptographically verified MOSIP individual
+ID. A set of 5 spoken phrases are recorded. The system converts each
 audio into a 192-dimensional speaker embedding using ECAPA-TDNN,
 computes an L2-normalised centroid, encrypts the centroid using Paillier
 homomorphic encryption, and stores the ciphertext in SQLite. No raw
-audio is stored.
+audio is stored. When enrolled via e-Signet, the citizen's record is
+marked as identity-verified with their MOSIP individual ID linked.
+
+5.1.1 MOSIP e-Signet Identity Verification
+
+Before or after voice enrollment, a citizen's identity can be verified
+against the MOSIP national ID system via the e-Signet OpenID Connect flow:
+
+1.  VeriVoice redirects the citizen to the e-Signet authorization endpoint.
+2.  The citizen authenticates on the e-Signet page using MOSIP biometrics
+    (fingerprint, iris, or face) captured via an SBI-compliant device
+    (Mock MDS in development, real hardware in production).
+3.  e-Signet redirects back to VeriVoice with an authorization code.
+4.  VeriVoice exchanges the code for an id_token at e-Signet's token
+    endpoint.
+5.  VeriVoice validates the JWT signature against MOSIP's public key (JWKS).
+6.  The verified `sub` claim (MOSIP individual_id) is extracted and linked
+    to the citizen's record, setting `identity_verified=True`.
 
 5.2 Voice Authentication (Every-Time Access)
 
@@ -175,9 +211,18 @@ Voice re-authentication is performed once at the start of the session
 -   Audio preprocessing pipeline (highpass filter, DC removal, spectral
     subtraction, pre-emphasis, VAD)
 
-6.2 Out-of-Scope (Deferred to MVP)
+-   MOSIP e-Signet OIDC integration for identity verification against
+    the national ID system (authorization code flow, JWT validation)
 
--   Live national ID registry integration
+-   MOSIP Mock MDS (Mock Device Service) for simulating biometric
+    capture devices (fingerprint, iris, face) during development
+
+-   Identity-verified enrollment: linking voice biometrics to a
+    MOSIP-verified identity instead of self-reported national ID
+
+-   Streamlit UI page for e-Signet identity verification flow
+
+6.2 Out-of-Scope (Deferred to MVP)
 
 -   Janus refugee deduplication module
 
@@ -207,14 +252,25 @@ processing layer, and the data persistence layer.
 
 7.1.1 High-Level Data Flow
 
-Enrollment: Audio capture → Preprocessing → ECAPA-TDNN (192-dim
-embedding) → L2-normalise → Centroid from 5 embeddings → Paillier HE
-encrypt → Store ciphertext in SQLite
+Enrollment (Manual ID): Audio capture → Preprocessing → ECAPA-TDNN
+(192-dim embedding) → L2-normalise → Centroid from 5 embeddings →
+Paillier HE encrypt → Store ciphertext in SQLite
+
+Enrollment (e-Signet Verified): Citizen authenticates via e-Signet OIDC
+(MOSIP biometrics) → receives verified id_token with MOSIP individual_id
+→ VeriVoice links voice enrollment to verified identity → same voice
+pipeline as above → citizen record marked identity_verified=True
 
 Authentication: Audio capture → Preprocessing → ECAPA-TDNN (192-dim
 embedding) → L2-normalise → HE scalar multiply with stored ciphertext →
 Decrypt dot product → Score vs. threshold + Whisper ASR transcript vs.
 challenge phrase → Verdict
+
+MOSIP e-Signet Identity Verification: VeriVoice redirects to e-Signet
+/authorize → citizen authenticates via MOSIP biometrics (SBI device /
+Mock MDS) → e-Signet returns authorization code → VeriVoice exchanges
+code for id_token → validates JWT → extracts verified sub
+(individual_id) → links to CITIZEN record
 
 Consent: gTTS plays consent text → User speaks response → Voice auth
 pipeline → Ed25519 sign consent token → Store token
@@ -260,6 +316,14 @@ answers → Store responses
 
   **ML Runtime**        PyTorch (CPU/CUDA)
 
+  **Identity            MOSIP e-Signet (OpenID Connect identity provider)
+  Provider**
+
+  **Mock Biometric      MOSIP Mock MDS (SBI protocol, Java 11+)
+  Devices**
+
+  **OIDC Client**       authlib + httpx (OIDC authorization code flow)
+
   **Infrastructure**    Vercel (hosting)
   --------------------- -------------------------------------------------
 
@@ -298,7 +362,9 @@ service modules.
 
 │ │ ├── authentication.py
 
-│ │ └── consent.py
+│ │ ├── consent.py
+
+│ │ └── mosip.py \# e-Signet OIDC request/response schemas
 
 │ ├── routers/
 
@@ -310,7 +376,9 @@ service modules.
 
 │ │ ├── consent.py \# POST /api/v1/consent
 
-│ │ └── service.py \# POST /api/v1/service-access
+│ │ ├── service.py \# POST /api/v1/service-access
+
+│ │ └── mosip.py \# e-Signet OIDC endpoints (authorize, callback, link)
 
 │ ├── services/
 
@@ -331,8 +399,10 @@ threshold)
 
 │ │ ├── consent_service.py \# ConsentService (Ed25519 signing)
 
-│ │ └── challenge_service.py \# ChallengeService (random phrase gen +
+│ │ ├── challenge_service.py \# ChallengeService (random phrase gen +
 match)
+
+│ │ └── mosip_service.py \# MosipService (e-Signet OIDC client)
 
 │ ├── db/
 
@@ -360,6 +430,16 @@ match)
 
 │ └── ivr_flow.py \# IVR call flow logic
 
+├── MOSIP_eSignet/ \# MOSIP e-Signet integration tooling (external, Java)
+
+│ ├── collab-mock-mds-reg/ \# Mock MDS for Registration (SBI device sim)
+
+│ │ └── target/ \# Pre-built JAR + classes + biometric profiles
+
+│ └── collab-mock-mds-auth/ \# Mock MDS for Auth (SBI device sim)
+
+│   └── target/ \# Pre-built JAR + classes + biometric profiles
+
 ├── migrations/
 
 │ └── alembic/ \# Alembic migration scripts
@@ -374,7 +454,9 @@ match)
 
 │ ├── test_matching.py
 
-│ └── test_transcription.py
+│ ├── test_transcription.py
+
+│ └── test_mosip.py \# e-Signet OIDC integration tests
 
 ├── pretrained_ecapa/ \# Downloaded ECAPA-TDNN model weights
 
@@ -581,6 +663,71 @@ verbally confirms consent.
                         interface defined; implementation pending.
   --------------------- -------------------------------------------------
 
+9.9 MosipService
+
+Handles the OpenID Connect integration with MOSIP e-Signet for
+identity verification.
+
+  --------------------- -------------------------------------------------
+  **Property**          Detail
+
+  **Protocol**          OpenID Connect 1.0 (Authorization Code Flow)
+
+  **Library**           authlib (OIDC client), httpx (HTTP transport)
+
+  **Identity Provider** MOSIP e-Signet
+
+  **Key Operations**    Build authorize URL, exchange authorization code
+                        for tokens, validate id_token JWT, extract
+                        verified individual_id
+
+  **JWT Validation**    Fetch JWKS from e-Signet, verify signature +
+                        expiry + audience + nonce
+
+  **State Management**  OIDC state and nonce stored in Redis with 5-min
+                        TTL to prevent replay attacks
+
+  **Output**            Verified MOSIP individual_id (the `sub` claim
+                        from the id_token)
+
+  **Dev Environment**   Uses MOSIP collab environment
+                        (esignet.collab.mosip.net); Mock MDS simulates
+                        biometric devices on localhost:4501-4600
+  --------------------- -------------------------------------------------
+
+9.10 MOSIP Mock MDS (External Dependency)
+
+Pre-built Java services that simulate biometric capture devices during
+development. Not part of the Python codebase — run as separate processes.
+
+  --------------------- -------------------------------------------------
+  **Property**          Detail
+
+  **Language**          Java 11+
+
+  **Protocol**          MOSIP SBI (Secure Biometric Interface)
+
+  **Modalities**        Fingerprint (slap/single), Iris
+                        (binocular/monocular), Face
+
+  **Registration MDS**  Supports RCAPTURE + STREAM for enrollment
+                        biometric capture
+
+  **Auth MDS**          Supports CAPTURE for authentication biometric
+                        capture
+
+  **Ports**             4501-4600 on 127.0.0.1
+
+  **Profiles**          Default and Automatic biometric data profiles
+                        with ISO 19794-compliant data
+
+  **Admin APIs**        /admin/score, /admin/delay, /admin/status,
+                        /admin/profile for runtime tuning
+
+  **Collab Server**     Connects to api-internal.collab.mosip.net for
+                        auth tokens and IDA certificates
+  --------------------- -------------------------------------------------
+
 10\. API Layer
 
 The backend exposes a RESTful API via FastAPI, served by Uvicorn. All
@@ -681,6 +828,62 @@ POST /api/v1/service-access
   **Response**          {form_id, question, transcribed_answer, status}
   --------------------- -------------------------------------------------
 
+GET /api/v1/mosip/authorize
+
+  --------------------- -------------------------------------------------
+  **Description**       Initiate MOSIP e-Signet OIDC login flow
+
+  **Query Params**      None (state and nonce generated server-side)
+
+  **Processing**        1\. Generate cryptographic state and nonce 2.
+                        Store in Redis with 5-min TTL 3. Build e-Signet
+                        authorize URL
+
+  **Response**          {authorize_url, state}
+
+  **Notes**             Client should redirect user to authorize_url
+  --------------------- -------------------------------------------------
+
+GET /api/v1/mosip/callback
+
+  --------------------- -------------------------------------------------
+  **Description**       e-Signet OIDC callback after citizen
+                        authentication
+
+  **Query Params**      code (string), state (string)
+
+  **Processing**        1\. Validate state against Redis 2. Exchange code
+                        for id_token at e-Signet /token endpoint 3.
+                        Validate JWT signature via JWKS 4. Validate
+                        nonce, expiry, audience 5. Extract verified sub
+                        (MOSIP individual_id)
+
+  **Response**          {mosip_individual_id, identity_verified: true,
+                        linked_citizen_id (if already linked)}
+
+  **Errors**            400: Invalid state or code; 401: JWT validation
+                        failed
+  --------------------- -------------------------------------------------
+
+POST /api/v1/mosip/link
+
+  --------------------- -------------------------------------------------
+  **Description**       Link verified MOSIP identity to existing citizen
+
+  **Request Body**      citizen_id (string), mosip_individual_id (string)
+
+  **Processing**        1\. Verify citizen exists 2. Verify
+                        mosip_individual_id was obtained from a valid
+                        e-Signet callback 3. Set mosip_individual_id and
+                        identity_verified=True on citizen record
+
+  **Response**          {citizen_id, mosip_individual_id,
+                        identity_verified: true, linked_at}
+
+  **Errors**            404: Citizen not found; 409: MOSIP ID already
+                        linked to another citizen; 400: Invalid session
+  --------------------- -------------------------------------------------
+
 10.2 Twilio Voice Webhook Endpoints
 
 For the IVR/telephony interface, FastAPI also exposes TwiML-compatible
@@ -735,8 +938,14 @@ CITIZEN
 
   citizen_id           UUID         PK        Auto-generated unique identifier
 
-  national_id_number   VARCHAR      UQ        Manually entered (no live registry
-                                              call in prototype)
+  national_id_number   VARCHAR      UQ        Manually entered or obtained from
+                                              MOSIP e-Signet
+
+  mosip_individual_id  VARCHAR      NULLABLE  Verified MOSIP subject ID from
+                                              e-Signet id_token (sub claim)
+
+  identity_verified    BOOLEAN                Default False; True when linked
+                                              via e-Signet OIDC flow
 
   preferred_language   VARCHAR                ISO 639-1 code (e.g., "sw", "en")
 
@@ -881,10 +1090,12 @@ AudioPreprocessor class and has been independently tested.
 
 14.1 Enrollment Flow
 
+14.1.1 Manual ID Enrollment (Legacy)
+
 11. Agent enters citizen's national ID number, preferred language, and
     phone number.
 
-12. System creates a CITIZEN record in SQLite.
+12. System creates a CITIZEN record in SQLite (identity_verified=False).
 
 13. Citizen speaks 5 sample phrases (prompted via gTTS or agent
     guidance).
@@ -907,6 +1118,29 @@ AudioPreprocessor class and has been independently tested.
 20. The encrypted ciphertext is stored in the VOICE_TEMPLATE table.
 
 21. An enrollment confirmation is returned.
+
+14.1.2 e-Signet Verified Enrollment
+
+1.  Agent initiates e-Signet identity verification via VeriVoice UI.
+
+2.  VeriVoice redirects to e-Signet /authorize endpoint (generates
+    cryptographic state + nonce, stores in Redis).
+
+3.  Citizen authenticates on e-Signet page using MOSIP biometrics
+    (fingerprint/iris/face via SBI device or Mock MDS in dev).
+
+4.  e-Signet redirects back to VeriVoice /api/v1/mosip/callback with
+    authorization code.
+
+5.  VeriVoice exchanges code for id_token, validates JWT, extracts
+    verified MOSIP individual_id.
+
+6.  System creates CITIZEN record with mosip_individual_id set and
+    identity_verified=True (or links to existing citizen).
+
+7.  Steps 13--21 above (voice enrollment pipeline) proceed as normal.
+
+8.  Enrollment confirmation includes identity_verified=True status.
 
 14.2 Authentication Flow
 
@@ -975,19 +1209,26 @@ AudioPreprocessor class and has been independently tested.
 The following sequence demonstrates the complete prototype flow for the
 hackathon demo:
 
-43. **Enrollment:** Agent enrolls a citizen. Citizen speaks 5 phrases.
-    Voice template (encrypted centroid) is created and stored.
+43. **Identity Verification (Optional):** Agent initiates MOSIP e-Signet
+    flow. Citizen authenticates via MOSIP biometrics (Mock MDS in dev).
+    Verified MOSIP individual_id is returned and linked to citizen record.
 
-44. **Authentication:** Citizen "calls" the system (Twilio IVR or
+44. **Enrollment:** Agent enrolls a citizen (with or without MOSIP
+    verification). Citizen speaks 5 phrases. Voice template (encrypted
+    centroid) is created and stored. If e-Signet was used, enrollment is
+    identity-verified.
+
+45. **Authentication:** Citizen "calls" the system (Twilio IVR or
     Streamlit upload). System plays a random challenge phrase. Citizen
     speaks the phrase. System performs voice biometric match + phrase
     transcript match. Result: "granted" or "denied."
 
-45. **Consent:** System reads consent text (gTTS). Citizen says "Yes."
+46. **Consent:** System reads consent text (gTTS). Citizen says "Yes."
     System verifies speaker + transcription. Signed consent token
-    generated and stored.
+    generated and stored. Token references MOSIP-verified identity when
+    available.
 
-46. **Service Access:** System plays health insurance form questions
+47. **Service Access:** System plays health insurance form questions
     (gTTS). Citizen answers verbally. Whisper ASR transcribes answers.
     Form completed.
 
@@ -1023,6 +1264,17 @@ hackathon demo:
   **MIN_AUDIO_DURATION**    1 second (16,000 samples)
 
   **ENROLLMENT_PHRASES**    5
+
+  **ESIGNET_BASE_URL**      e-Signet server URL (env-specific, e.g.,
+                            esignet.collab.mosip.net)
+
+  **ESIGNET_CLIENT_ID**     OIDC client ID registered with e-Signet
+
+  **ESIGNET_REDIRECT_URI**  http://localhost:8000/api/v1/mosip/callback
+
+  **ESIGNET_SCOPES**        openid profile
+
+  **MOCK_MDS_PORTS**        4501-4600
   ------------------------- -------------------------------------------------
 
 17\. Key Libraries & Dependencies
@@ -1079,6 +1331,12 @@ prototype (requirements.txt):
   twilio                Telephony              Twilio Voice API integration
 
   transformers          ML utilities           HuggingFace model support
+
+  authlib               OIDC client            e-Signet authorization code
+                                               flow, JWT validation
+
+  httpx                 HTTP client            Async HTTP transport for
+                                               authlib OIDC calls
   --------------------- ---------------------- ----------------------------
 
 18\. Integration Notes
@@ -1099,7 +1357,12 @@ The Twilio Voice API integration requires a publicly accessible webhook
 URL. During development, ngrok or a similar tunneling service can expose
 the local FastAPI server. In production (Vercel), the webhook endpoints
 are directly accessible. Twilio's \<Record\> verb captures audio, which
-is then downloaded and processed through the backend pipeline.
+is then downloaded and processed through the backend pipeline. All IVR
+recordings use explicit keypad stop: the caller hears a beep (recording
+starts), speaks their response, and presses \# on the keypad to end the
+recording. Silence detection is disabled (timeout=0) to prevent
+mid-sentence cutoffs from pauses. A bilingual prompt ("Press pound when
+you are done" / "Bonyeza # ukimaliza") plays before each recording.
 
 18.3 Streamlit Integration
 
@@ -1113,7 +1376,24 @@ but provides a convenient browser-based demo path.
 
 Redis is used for session state management and temporary data such as
 challenge phrase associations (mapping a session to the expected phrase
-for transcript matching). It is not used for SMS OTP in the prototype.
+for transcript matching) and OIDC state/nonce storage for e-Signet flows
+(with 5-minute TTL to prevent replay attacks). It is not used for SMS
+OTP in the prototype.
+
+18.5 MOSIP e-Signet Integration
+
+VeriVoice integrates with MOSIP e-Signet via the standard OpenID Connect
+authorization code flow. The MosipService class handles all OIDC
+communication (authorize URL generation, code-for-token exchange, JWT
+validation against MOSIP JWKS). During development, MOSIP Mock MDS
+services (pre-built Java applications in `MOSIP_eSignet/`) simulate
+biometric capture devices so that e-Signet's authentication page can
+capture fingerprint/iris/face biometrics without real hardware. The Mock
+MDS services must be started as separate Java processes before testing
+e-Signet flows. The prototype uses the MOSIP collab environment
+(`collab.mosip.net`). Identity verification via e-Signet is optional —
+the system supports both manual national ID entry and e-Signet-verified
+enrollment, ensuring backward compatibility.
 
 19\. MVP Roadmap (Post-Prototype)
 
@@ -1150,6 +1430,9 @@ prototype:
 
 -   **Fairness Auditing:** Implement demographic fairness monitoring
     across dialects and voice characteristics.
+
+-   **Real Biometric Hardware:** Replace Mock MDS with production
+    SBI-compliant biometric scanners for e-Signet authentication.
 
 20\. Glossary
 
@@ -1212,4 +1495,36 @@ prototype:
   **HSM**               Hardware Security Module --- a physical device
                         for managing and protecting cryptographic keys
                         (deferred to MVP).
+
+  **MOSIP**             Modular Open Source Identity Platform --- an
+                        open-source framework for building national
+                        digital identity systems, supporting biometric
+                        enrollment, authentication, and ID issuance.
+
+  **e-Signet**          MOSIP's OpenID Connect (OIDC) identity provider
+                        that enables third-party services to authenticate
+                        citizens against the national ID system using
+                        biometrics.
+
+  **SBI**               Secure Biometric Interface --- MOSIP's standard
+                        protocol for communication between biometric
+                        capture devices and MOSIP software. Defines
+                        HTTP-based methods (MOSIPDISC, MOSIPDINFO,
+                        CAPTURE, RCAPTURE, STREAM).
+
+  **Mock MDS**          Mock Device Service --- a pre-built Java
+                        application that simulates SBI-compliant
+                        biometric capture devices (fingerprint, iris,
+                        face) for development and testing without real
+                        hardware.
+
+  **OIDC**              OpenID Connect --- an identity layer built on
+                        OAuth 2.0 that enables clients to verify
+                        identity based on authentication performed by
+                        an authorization server and obtain basic
+                        profile information.
+
+  **JWKS**              JSON Web Key Set --- a set of public keys used
+                        to verify JWT signatures. VeriVoice fetches
+                        MOSIP's JWKS to validate e-Signet id_tokens.
   --------------------- -------------------------------------------------

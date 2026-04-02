@@ -13,11 +13,15 @@ def create_citizen(
     national_id_number: str,
     preferred_language: str = "en",
     phone_number: str = "",
+    mosip_individual_id: str | None = None,
+    identity_verified: bool = False,
 ) -> Citizen:
     citizen = Citizen(
         national_id_number=national_id_number,
         preferred_language=preferred_language,
         phone_number=phone_number,
+        mosip_individual_id=mosip_individual_id,
+        identity_verified=identity_verified,
     )
     db.add(citizen)
     db.commit()
@@ -31,6 +35,21 @@ def get_citizen_by_id(db: Session, citizen_id: str) -> Citizen | None:
 
 def get_citizen_by_national_id(db: Session, national_id_number: str) -> Citizen | None:
     return db.query(Citizen).filter(Citizen.national_id_number == national_id_number).first()
+
+
+def get_citizen_by_mosip_id(db: Session, mosip_individual_id: str) -> Citizen | None:
+    return db.query(Citizen).filter(Citizen.mosip_individual_id == mosip_individual_id).first()
+
+
+def link_mosip_identity(db: Session, citizen_id: str, mosip_individual_id: str) -> Citizen:
+    citizen = get_citizen_by_id(db, citizen_id)
+    if citizen is None:
+        raise ValueError(f"Citizen {citizen_id} not found")
+    citizen.mosip_individual_id = mosip_individual_id
+    citizen.identity_verified = True
+    db.commit()
+    db.refresh(citizen)
+    return citizen
 
 
 # ── VoiceTemplate ────────────────────────────────────────────────────────────

@@ -11,18 +11,42 @@ API = f"{BACKEND_URL}/api/v1"
 st.set_page_config(page_title="VeriVoice Demo", layout="wide")
 st.title("VeriVoice — Voice Authentication Demo")
 
-page = st.sidebar.radio("Navigate", ["Enroll", "Authenticate", "Consent", "Service Access"])
+page = st.sidebar.radio("Navigate", ["Enroll", "Authenticate", "Consent", "Service Access", "Verify Identity (MOSIP)"])
+
+# ── MOSIP session state badge in sidebar ─────────────────────────────────
+if st.session_state.get("mosip_individual_id"):
+    st.sidebar.success(f"MOSIP Verified: {st.session_state['mosip_individual_id'][:20]}...")
+else:
+    st.sidebar.caption("MOSIP Identity: Not verified")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ENROLL
 # ═════════════════════════════════════════════════════════════════════════════
 if page == "Enroll":
-    st.header("Voice Enrollment")
+    if st.session_state.get("mosip_individual_id"):
+        st.header("Voice Enrollment  —  MOSIP Verified")
+    else:
+        st.header("Voice Enrollment  —  Unverified")
     st.markdown("Register a citizen with **5 voice samples**.")
 
+    # ── MOSIP-verified enrollment toggle ─────────────────────────────────
+    use_mosip = False
+    mosip_id_value = st.session_state.get("mosip_individual_id")
+    if mosip_id_value:
+        use_mosip = st.toggle("Use Verified MOSIP Identity for Enrollment", value=True)
+        if use_mosip:
+            st.info(f"Enrolling with MOSIP ID: **{mosip_id_value}**")
+
     with st.form("enroll_form"):
-        national_id = st.text_input("National ID Number", placeholder="KE-123456")
+        if use_mosip:
+            national_id = st.text_input(
+                "National ID Number",
+                placeholder="KE-123456",
+                help="Still required as a local reference, even with MOSIP verification",
+            )
+        else:
+            national_id = st.text_input("National ID Number", placeholder="KE-123456")
         language = st.selectbox("Preferred Language", ["en", "sw"], index=0)
         phone = st.text_input("Phone Number (E.164)", placeholder="+254700000000")
 
@@ -52,12 +76,18 @@ if page == "Enroll":
                 "preferred_language": language,
                 "phone_number": phone,
             }
+            if use_mosip and mosip_id_value:
+                data["mosip_individual_id"] = mosip_id_value
+
             with st.spinner("Enrolling..."):
                 try:
                     resp = httpx.post(f"{API}/enroll", data=data, files=files, timeout=120.0)
                     if resp.status_code == 200:
                         body = resp.json()
-                        st.success(f"Enrolled successfully!")
+                        if body.get("identity_verified"):
+                            st.success("Enrolled successfully with MOSIP-verified identity!")
+                        else:
+                            st.success("Enrolled successfully!")
                         st.json(body)
                     else:
                         try:
@@ -73,7 +103,10 @@ if page == "Enroll":
 # AUTHENTICATE
 # ═════════════════════════════════════════════════════════════════════════════
 elif page == "Authenticate":
-    st.header("Voice Authentication")
+    if st.session_state.get("mosip_individual_id"):
+        st.header("Voice Authentication  —  MOSIP Verified")
+    else:
+        st.header("Voice Authentication  —  Unverified")
     st.markdown("Dual-stage: **voice biometric** + **phrase transcript** match.")
 
     citizen_id = st.text_input("Citizen ID (UUID)", key="auth_citizen_id")
@@ -347,3 +380,118 @@ elif page == "Service Access":
             st.session_state["svc_answers"] = {}
             st.session_state["svc_step"] = 0
             st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VERIFY IDENTITY (MOSIP e-Signet)
+# ═════════════════════════════════════════════════════════════════════════════
+elif page == "Verify Identity (MOSIP)":
+    st.header("Verify Identity via MOSIP e-Signet")
+    st.markdown(
+        "Authenticate against the **MOSIP national ID system** using biometrics "
+        "(fingerprint, iris, or face) via the e-Signet OpenID Connect flow."
+    )
+
+    # ── Handle OIDC callback (code + state in query params) ─────────────
+    qp = st.query_params
+    oidc_code = qp.get("code")
+    oidc_state = qp.get("state")
+
+    if oidc_code and oidc_state:
+        # We've been redirected back from e-Signet with an authorization code.
+        # Exchange it for a verified MOSIP identity via the backend callback.
+        st.info("Processing e-Signet callback...")
+        try:
+            resp = httpx.get(
+                f"{API}/mosip/callback",
+                params={"code": oidc_code, "state": oidc_state},
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                identity = resp.json()
+                st.session_state["mosip_individual_id"] = identity["mosip_individual_id"]
+                st.session_state["mosip_identity_verified"] = identity["identity_verified"]
+                # Clear query params so a page refresh doesn't re-trigger
+                st.query_params.clear()
+                st.rerun()
+            else:
+                try:
+                    detail = resp.json().get("detail", resp.text)
+                except Exception:
+                    detail = resp.text
+                st.error(f"e-Signet callback failed ({resp.status_code}): {detail}")
+                st.query_params.clear()
+        except httpx.ConnectError:
+            st.error(f"Cannot connect to backend at {BACKEND_URL}.")
+
+    # ── Show current verification status ────────────────────────────────
+    if st.session_state.get("mosip_individual_id"):
+        st.success("Identity Confirmed")
+        col1, col2 = st.columns(2)
+        col1.metric("MOSIP Individual ID", st.session_state["mosip_individual_id"])
+        col2.metric("Status", "Verified")
+
+        st.markdown("---")
+
+        # ── Link to existing citizen ────────────────────────────────────
+        st.subheader("Link to Existing Citizen")
+        link_citizen_id = st.text_input(
+            "Citizen ID (UUID) to link",
+            key="mosip_link_citizen_id",
+            placeholder="550e8400-e29b-41d4-a716-446655440000",
+        )
+        if st.button("Link Identity"):
+            if not link_citizen_id:
+                st.error("Enter a Citizen ID to link.")
+            else:
+                try:
+                    resp = httpx.post(
+                        f"{API}/mosip/link",
+                        json={
+                            "citizen_id": link_citizen_id,
+                            "mosip_individual_id": st.session_state["mosip_individual_id"],
+                        },
+                        timeout=30.0,
+                    )
+                    if resp.status_code == 200:
+                        body = resp.json()
+                        st.success(f"Identity linked to citizen {body['citizen_id']}!")
+                        st.json(body)
+                    else:
+                        try:
+                            detail = resp.json().get("detail", resp.text)
+                        except Exception:
+                            detail = resp.text
+                        st.error(f"Error {resp.status_code}: {detail}")
+                except httpx.ConnectError:
+                    st.error(f"Cannot connect to backend at {BACKEND_URL}.")
+
+        # ── Clear verification ──────────────────────────────────────────
+        st.markdown("---")
+        if st.button("Clear Verification"):
+            del st.session_state["mosip_individual_id"]
+            if "mosip_identity_verified" in st.session_state:
+                del st.session_state["mosip_identity_verified"]
+            st.rerun()
+
+    else:
+        # ── Initiate e-Signet OIDC flow ─────────────────────────────────
+        st.markdown("Click below to verify your identity via MOSIP e-Signet.")
+        if st.button("Verify with MOSIP"):
+            try:
+                resp = httpx.get(f"{API}/mosip/authorize", timeout=10.0)
+                if resp.status_code == 200:
+                    body = resp.json()
+                    st.session_state["mosip_oidc_state"] = body["state"]
+                    st.markdown(
+                        f'<a href="{body["authorize_url"]}" target="_self">'
+                        f'<button style="background-color:#4CAF50;color:white;'
+                        f'padding:10px 24px;border:none;border-radius:4px;'
+                        f'cursor:pointer;font-size:16px;">'
+                        f'Open MOSIP e-Signet Login</button></a>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.error(f"Error {resp.status_code}: {resp.text}")
+            except httpx.ConnectError:
+                st.error(f"Cannot connect to backend at {BACKEND_URL}.")
