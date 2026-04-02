@@ -1389,6 +1389,13 @@ recording. Silence detection is disabled (timeout=0) to prevent
 mid-sentence cutoffs from pauses. A bilingual prompt ("Press pound when
 you are done" / "Bonyeza # ukimaliza") plays before each recording.
 
+IVR TTS strategy varies by language: English prompts use Twilio's built-in
+\<Say voice="alice"\> (rendered inline with zero latency). Swahili prompts
+use gTTS (Google Text-to-Speech) which has proper Swahili pronunciation —
+audio files are generated server-side, served via /tts-audio/, and played
+via Twilio's \<Play\> verb. Static prompts (e.g., "Bonyeza # ukimaliza")
+are cached in memory so repeated calls avoid re-generation.
+
 During IVR enrollment, the system randomly selects a phrase from the
 bilingual phrase pool for each of the 5 recordings and plays it via TTS.
 The caller repeats the phrase and presses # when done. This ensures

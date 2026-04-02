@@ -87,6 +87,20 @@ TWILIO_PHONE_NUMBER=+1234567890
 
 The app reads these via `app/config.py`. When `TWILIO_AUTH_TOKEN` is set, all incoming webhook requests are validated against Twilio's `X-Twilio-Signature` header. Leave it blank during initial local testing to skip validation.
 
+### Swahili TTS (gTTS via `<Play>`)
+
+Swahili IVR prompts use gTTS (Google Text-to-Speech) instead of Twilio's `<Say>` voice, because `alice` does not support Swahili pronunciation. The generated MP3 files are served from the FastAPI server at `/tts-audio/` and played via `<Play>`. Add these to your `.env`:
+
+```env
+# Public URL (must match your ngrok URL so Twilio can fetch the audio)
+PUBLIC_BASE_URL=https://a1b2c3d4.ngrok-free.app
+TTS_AUDIO_DIR=./tts_audio
+```
+
+> **Note:** `PUBLIC_BASE_URL` must be the same URL that Twilio uses to reach your server (your ngrok URL). If this is wrong, Swahili prompts will fail with a Twilio error because it can't fetch the audio file. English prompts are unaffected (they use `<Say>` which requires no file serving).
+
+Static Swahili prompts (like "Bonyeza # ukimaliza") are cached in memory after first generation, so subsequent calls have zero gTTS latency.
+
 ### MOSIP e-Signet (Optional)
 
 If you want to test identity-verified enrollment via the IVR (where a citizen's identity is verified against the MOSIP national ID system before voice enrollment), also add:
@@ -894,7 +908,8 @@ This test takes ~90 seconds (loads ECAPA-TDNN + Whisper models) and verifies:
 | Caller confused about when to speak | No beep or unclear prompt | Ensure `playBeep="true"` is set; consider adding "speak after the beep" to prompts |
 | Enrollment says complete but no voiceprint stored | Prototype callback doesn't download recordings yet | This is expected in the prototype — the callback flow is wired, but full processing requires production deployment |
 | ngrok URL changed | Free ngrok assigns a new URL on each restart | Update the Twilio webhook URL, or use a paid ngrok plan for a stable subdomain |
-| Swahili TTS sounds like English | The `<Say>` voice is set to `alice` / `en-US` for all languages | For production, switch to a Swahili-capable TTS voice or use gTTS with `<Play>` instead of `<Say>` |
+| Swahili prompts not playing | `PUBLIC_BASE_URL` doesn't match your ngrok URL | Set `PUBLIC_BASE_URL` in `.env` to your current ngrok URL (e.g., `https://a1b2c3d4.ngrok-free.app`). Twilio fetches gTTS audio from this URL |
+| Swahili audio sounds robotic | gTTS quality is lower than commercial TTS | Expected — gTTS is free-tier Google Translate TTS. Quality is acceptable for a prototype and far better than Twilio `alice` mispronouncing Swahili |
 | Read-back summary has wrong answers | Query parameter encoding issue with special characters in names | URL-encode answer values; check ngrok inspector for the raw query string |
 | MOSIP identity verification not available in IVR | By design -- e-Signet OIDC requires a web browser | Use the Streamlit UI (`/Verify Identity`) to verify via MOSIP before or after IVR enrollment |
 | Redis connection refused | Redis not running or wrong URL | Start Redis (`redis-server`) and check `REDIS_URL` in `.env` |

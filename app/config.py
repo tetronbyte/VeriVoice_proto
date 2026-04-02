@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     TWILIO_AUTH_TOKEN: str = ""
     TWILIO_PHONE_NUMBER: str = ""
 
+    # TTS audio serving (for Swahili IVR prompts via gTTS + <Play>)
+    PUBLIC_BASE_URL: str = "http://localhost:8000"
+    TTS_AUDIO_DIR: str = "./tts_audio"
+
     # Streamlit (used by frontend, but matched in .env)
     BACKEND_URL: str = "http://localhost:8000"
 

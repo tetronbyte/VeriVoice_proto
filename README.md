@@ -119,6 +119,8 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 
 All IVR voice recordings use **keypad # to stop** (silence detection is disabled). The caller hears a beep, speaks, and presses `#` when done. This gives callers explicit control and prevents mid-sentence cutoffs.
 
+**IVR TTS strategy:** English prompts use Twilio's built-in `<Say voice="alice">` (zero latency). Swahili prompts use gTTS-generated audio served via `<Play>` — Google TTS has proper Swahili pronunciation while Twilio's `alice` voice does not. Audio files are served from `/tts-audio/` with automatic caching of repeated prompts. Set `PUBLIC_BASE_URL` to your ngrok URL in `.env`.
+
 Interactive API docs available at `http://localhost:8000/docs` (Swagger UI).
 
 ## Architecture
@@ -273,6 +275,21 @@ To test the phone-based IVR flow:
 - **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.3.1 (2026-04-02)
+
+**Changes**
+- **Swahili IVR prompts via gTTS `<Play>`** -- All Swahili voice prompts in the IVR now use gTTS-generated audio played via Twilio `<Play>` instead of `<Say voice="alice">`, which has no Swahili pronunciation support. English prompts remain `<Say>`. Audio files are served via FastAPI StaticFiles at `/tts-audio/` with an in-memory cache to avoid re-generating static prompts (`twilio_integration/webhook_handler.py`, `app/services/tts_service.py`, `app/main.py`)
+
+**Files Changed**
+| File | Change |
+|---|---|
+| `twilio_integration/webhook_handler.py` | Added `_say_or_play()` helper; all prompts use it instead of raw `.say()` |
+| `app/services/tts_service.py` | Added `synthesize_with_url()` with hash-based caching; default output dir from config |
+| `app/main.py` | Mounted `/tts-audio/` StaticFiles for serving gTTS audio to Twilio |
+| `app/config.py` | Added `PUBLIC_BASE_URL` and `TTS_AUDIO_DIR` settings |
+| `.env.example` | Added `PUBLIC_BASE_URL` and `TTS_AUDIO_DIR` |
+| `tests/test_twilio.py` | Updated Swahili test to expect `<Play>` instead of `<Say>` |
 
 ### v1.3.0 (2026-04-02)
 

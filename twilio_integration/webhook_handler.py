@@ -2,6 +2,11 @@
 
 State is passed via query parameters to keep the server stateless.
 Twilio request validation is enforced when TWILIO_AUTH_TOKEN is configured.
+
+TTS strategy:
+  - English prompts → Twilio <Say voice="alice"> (rendered inline, zero latency)
+  - Swahili prompts → gTTS MP3 → served via /tts-audio/ → Twilio <Play>
+    (Google TTS has proper Swahili pronunciation; Twilio alice does not)
 """
 
 import io
@@ -51,6 +56,22 @@ def _twiml_response(response: VoiceResponse) -> Response:
     return Response(content=str(response), media_type="application/xml")
 
 
+def _say_or_play(parent, text: str, lang: str) -> None:
+    """Speak a prompt via the best TTS for the language.
+
+    - English: Twilio <Say voice="alice"> (inline, zero latency)
+    - Swahili: gTTS → MP3 file → <Play url> (proper Swahili pronunciation)
+
+    Works with both VoiceResponse and Gather (both expose .say() and .play()).
+    """
+    if lang == "sw":
+        url = _tts_service.synthesize_with_url(text, language="sw")
+        logger.debug("[IVR] <Play> Swahili: '%s...' → %s", text[:50], url)
+        parent.play(url)
+    else:
+        parent.say(text, voice="alice", language="en-US")
+
+
 async def _validate_twilio_request(request: Request) -> None:
     """Validate that the request originated from Twilio (if auth token is configured)."""
     if not settings.TWILIO_AUTH_TOKEN:
@@ -82,6 +103,7 @@ async def welcome(request: Request):
         method="POST",
         timeout=5,
     )
+    # Welcome is always in English — caller hasn't chosen a language yet
     gather.say(
         "Welcome to VeriVoice. Press 1 for English. Press 2 for Swahili.",
         voice="alice",
@@ -115,7 +137,7 @@ async def welcome_language(
         method="POST",
         timeout=5,
     )
-    gather.say(msg, voice="alice", language="en-US" if lang == "en" else "en-US")
+    _say_or_play(gather, msg, lang)
     response.append(gather)
     return _twiml_response(response)
 
@@ -169,10 +191,13 @@ async def enroll_prompt(
             finish_on_key="#",
             timeout=10,
         )
-        if lang == "sw":
-            gather.say("Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #.", voice="alice")
-        else:
-            gather.say("Please enter your national ID number followed by the pound key.", voice="alice")
+        _say_or_play(
+            gather,
+            "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #."
+            if lang == "sw"
+            else "Please enter your national ID number followed by the pound key.",
+            lang,
+        )
         response.append(gather)
         return _twiml_response(response)
 
@@ -184,25 +209,27 @@ async def enroll_prompt(
         # All 5 recordings done — handled by enroll_callback
         logger.info("[IVR] ── ENROLL COMPLETE ── All %d samples recorded (nid=%s, lang=%s)",
                      settings.ENROLLMENT_PHRASES, nid, lang)
-        response.say("Enrollment complete. Thank you." if lang == "en" else "Usajili umekamilika. Asante.", voice="alice")
+        _say_or_play(
+            response,
+            "Usajili umekamilika. Asante." if lang == "sw" else "Enrollment complete. Thank you.",
+            lang,
+        )
         response.hangup()
         return _twiml_response(response)
 
     # Pick a random phrase and prompt the caller to repeat it
     phrase = pick_random_enrollment_phrase(language=lang)
-    if lang == "sw":
-        prompt_text = f"Tafadhali sema: {phrase}"
-    else:
-        prompt_text = f"Please say: {phrase}"
+    prompt_text = f"Tafadhali sema: {phrase}" if lang == "sw" else f"Please say: {phrase}"
 
     logger.info("[IVR] ── ENROLL step=%d/%d ── Playing phrase: '%s' (nid=%s, lang=%s)",
                  step + 1, settings.ENROLLMENT_PHRASES, phrase, nid, lang)
 
-    response.say(prompt_text, voice="alice")
-    if lang == "sw":
-        response.say("Bonyeza # ukimaliza.", voice="alice")
-    else:
-        response.say("Press pound when you are done.", voice="alice")
+    _say_or_play(response, prompt_text, lang)
+    _say_or_play(
+        response,
+        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        lang,
+    )
     response.record(
         max_length=10,
         action=f"/twilio/voice/enroll/callback?lang={lang}&step={step}&national_id={nid}",
@@ -241,10 +268,13 @@ async def enroll_callback(
     else:
         logger.info("[IVR] ── ENROLL CALLBACK ── All %d samples received — completing enrollment",
                      settings.ENROLLMENT_PHRASES)
-        if lang == "sw":
-            response.say("Usajili umekamilika. Asante.", voice="alice")
-        else:
-            response.say("All five samples recorded. Enrollment complete. Thank you.", voice="alice")
+        _say_or_play(
+            response,
+            "Usajili umekamilika. Asante."
+            if lang == "sw"
+            else "All five samples recorded. Enrollment complete. Thank you.",
+            lang,
+        )
         response.hangup()
 
     return _twiml_response(response)
@@ -270,12 +300,16 @@ async def authenticate_prompt(
     logger.info("[IVR] ── AUTHENTICATE ── Challenge generated: id=%s phrase='%s' (lang=%s)",
                  challenge_id, phrase, lang)
 
-    if lang == "sw":
-        response.say(f"Tafadhali sema: {phrase}", voice="alice")
-        response.say("Bonyeza # ukimaliza.", voice="alice")
-    else:
-        response.say(f"Please say the following phrase: {phrase}", voice="alice")
-        response.say("Press pound when you are done.", voice="alice")
+    _say_or_play(
+        response,
+        f"Tafadhali sema: {phrase}" if lang == "sw" else f"Please say the following phrase: {phrase}",
+        lang,
+    )
+    _say_or_play(
+        response,
+        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        lang,
+    )
 
     response.record(
         max_length=10,
@@ -311,13 +345,22 @@ async def authenticate_callback(
     # In production: download RecordingUrl, run through auth pipeline.
     # For prototype, we announce that processing would happen here.
     logger.info("[IVR] ── AUTH CALLBACK ── Processing voice (prototype: placeholder)")
-    if lang == "sw":
-        response.say("Sauti yako inachakatwa. Tafadhali subiri.", voice="alice")
-    else:
-        response.say("Your voice is being processed. Please wait.", voice="alice")
+    _say_or_play(
+        response,
+        "Sauti yako inachakatwa. Tafadhali subiri."
+        if lang == "sw"
+        else "Your voice is being processed. Please wait.",
+        lang,
+    )
 
     logger.info("[IVR] ── AUTH CALLBACK ── Authentication complete — hanging up")
-    response.say("Authentication complete. Thank you." if lang == "en" else "Uthibitishaji umekamilika. Asante.", voice="alice")
+    _say_or_play(
+        response,
+        "Uthibitishaji umekamilika. Asante."
+        if lang == "sw"
+        else "Authentication complete. Thank you.",
+        lang,
+    )
     response.hangup()
     return _twiml_response(response)
 
@@ -341,11 +384,12 @@ async def consent_prompt(
     else:
         consent_text = "I consent to share my health records with the Ministry of Health. Say Yes to agree."
 
-    response.say(consent_text, voice="alice")
-    if lang == "sw":
-        response.say("Bonyeza # ukimaliza.", voice="alice")
-    else:
-        response.say("Press pound when you are done.", voice="alice")
+    _say_or_play(response, consent_text, lang)
+    _say_or_play(
+        response,
+        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        lang,
+    )
     response.record(
         max_length=10,
         action=f"/twilio/voice/consent/callback?lang={lang}",
@@ -369,7 +413,13 @@ async def consent_callback(
     logger.info("[IVR] ── CONSENT CALLBACK ── RecordingUrl=%s (lang=%s)",
                  RecordingUrl[:80] if RecordingUrl else "(none)", lang)
     response = VoiceResponse()
-    response.say("Your consent has been recorded. Thank you." if lang == "en" else "Idhini yako imerekodiwa. Asante.", voice="alice")
+    _say_or_play(
+        response,
+        "Idhini yako imerekodiwa. Asante."
+        if lang == "sw"
+        else "Your consent has been recorded. Thank you.",
+        lang,
+    )
     logger.info("[IVR] ── CONSENT CALLBACK ── Consent recorded — hanging up")
     response.hangup()
     return _twiml_response(response)
@@ -429,13 +479,14 @@ async def service_prompt(
                 f"Is this correct?"
             )
 
-        response.say(summary, voice="alice")
+        _say_or_play(response, summary, lang)
 
         # Record confirmation (yes/no)
-        if lang == "sw":
-            response.say("Bonyeza # ukimaliza.", voice="alice")
-        else:
-            response.say("Press pound when you are done.", voice="alice")
+        _say_or_play(
+            response,
+            "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+            lang,
+        )
         response.record(
             max_length=5,
             action=(
@@ -453,11 +504,12 @@ async def service_prompt(
 
     logger.info("[IVR] ── SERVICE Q%d/%d ── Playing question: '%s' (lang=%s)",
                  question_index + 1, len(q_list), q_list[question_index], lang)
-    response.say(q_list[question_index], voice="alice")
-    if lang == "sw":
-        response.say("Bonyeza # ukimaliza.", voice="alice")
-    else:
-        response.say("Press pound when you are done.", voice="alice")
+    _say_or_play(response, q_list[question_index], lang)
+    _say_or_play(
+        response,
+        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        lang,
+    )
     response.record(
         max_length=15,
         action=(
@@ -540,10 +592,13 @@ async def service_confirm(
 
     # In production: transcribe RecordingUrl, check for "yes"/"ndiyo"
     # For prototype: assume confirmed
-    if lang == "sw":
-        response.say("Fomu yako imekamilika. Asante kwa kutumia VeriVoice.", voice="alice")
-    else:
-        response.say("Your form is complete. Thank you for using VeriVoice.", voice="alice")
+    _say_or_play(
+        response,
+        "Fomu yako imekamilika. Asante kwa kutumia VeriVoice."
+        if lang == "sw"
+        else "Your form is complete. Thank you for using VeriVoice.",
+        lang,
+    )
     logger.info("[IVR] ── SERVICE CONFIRM ── Form complete — hanging up")
     response.hangup()
     return _twiml_response(response)

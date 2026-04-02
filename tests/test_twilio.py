@@ -106,11 +106,11 @@ class TestEnrollment:
     def test_swahili_enrollment_prompt(self):
         resp = client.post("/twilio/voice/enroll?lang=sw&step=0&national_id=SW-456")
         root = _parse_twiml(resp.text)
-        # step=0 with national_id present should show recording prompt (step treated as 0)
-        # Actually step=0 with national_id should go to first recording
-        say = root.find("Say")
-        assert say is not None
-        assert "Tafadhali" in say.text
+        # Swahili prompts use gTTS <Play> instead of <Say>
+        play = root.find("Play")
+        assert play is not None, "Swahili prompt should use <Play> (gTTS audio)"
+        record = root.find("Record")
+        assert record is not None
 
 
 class TestAuthenticate:

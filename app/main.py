@@ -1,6 +1,8 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.routers import authentication, consent, enrollment, mosip, service
@@ -23,6 +25,11 @@ app.include_router(consent.router, prefix="/api/v1", tags=["consent"])
 app.include_router(service.router, prefix="/api/v1", tags=["service"])
 app.include_router(mosip.router, prefix="/api/v1", tags=["mosip"])
 app.include_router(twilio_router, prefix="/twilio", tags=["twilio"])
+
+# ── Serve gTTS audio files for Swahili IVR prompts ─────────────────────────
+_tts_dir = Path(settings.TTS_AUDIO_DIR)
+_tts_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/tts-audio", StaticFiles(directory=str(_tts_dir)), name="tts-audio")
 
 
 @app.get("/health")
