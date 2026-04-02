@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # ML Models
     ECAPA_SOURCE: str = "speechbrain/spkrec-ecapa-voxceleb"
     WHISPER_MODEL: str = "large-v3"
+    SWAHILI_ASR_MODEL: str = "badrex/w2v-bert-2.0-swahili-as"
 
     # Audio preprocessing
     SAMPLE_RATE: int = 16000

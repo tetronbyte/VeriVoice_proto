@@ -417,7 +417,9 @@ The system plays:
 
 **Factor 2 — Transcript Match (2FA):**
 
-1. The same audio is transcribed using OpenAI Whisper (large-v3)
+1. The same audio is transcribed using the language-appropriate ASR model:
+   - **English:** OpenAI Whisper (large-v3)
+   - **Swahili:** w2v-BERT 2.0 (`badrex/w2v-bert-2.0-swahili-as`) — outperforms Whisper on Swahili speech
 2. Both the transcript and the expected challenge phrase are normalized:
    - Unicode normalization (unidecode)
    - Lowercased
@@ -427,7 +429,7 @@ The system plays:
    - Each word in the expected phrase is checked against the transcript
    - Score = (matched words) / (total expected words)
    - The threshold is **75%** (configurable via `TRANSCRIPT_MATCH_THRESHOLD`)
-   - Example: expected has 8 words, Whisper gets 6 correct = 75% = pass
+   - Example: expected has 8 words, ASR gets 6 correct = 75% = pass
 
 **Decision:** Both factors must pass. The result (`granted` or `denied`) is logged in the `AUTH_EVENT` table.
 
@@ -542,7 +544,7 @@ The call ends (hangup).
 1. Twilio saves the recording and provides a `RecordingUrl`
 2. Backend downloads the audio via authenticated HTTP request
 3. `AudioPreprocessor` cleans the audio (16 kHz, VAD, noise reduction)
-4. `TranscriptionService` (Whisper large-v3) transcribes speech to text
+4. `TranscriptionService` transcribes speech to text (Whisper for English, w2v-BERT for Swahili)
 5. For numeric answers (dependants): spoken words are parsed to digits ("three" -> 3, "tatu" -> 3)
 6. Answers are accumulated across steps via URL query parameters (stateless design)
 7. After all 3 answers, TTS generates a summary read-back for human confirmation

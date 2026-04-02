@@ -144,7 +144,7 @@ Both stages must pass for access to be granted:
 
 1. **Voice Biometric** — Live audio is preprocessed, embedded via ECAPA-TDNN, then matched against the stored Paillier-encrypted centroid using homomorphic scalar multiplication. The decrypted dot product is compared against `MATCH_THRESHOLD` (0.45).
 
-2. **Phrase Liveness** — The same audio is transcribed by Whisper ASR and compared against the expected challenge phrase (normalized: lowercase, stripped punctuation, unidecoded).
+2. **Phrase Liveness** — The same audio is transcribed (Whisper for English, w2v-BERT for Swahili) and compared against the expected challenge phrase (normalized: lowercase, stripped punctuation, unidecoded).
 
 ### Audio Preprocessing Pipeline
 
@@ -165,7 +165,8 @@ Both stages must pass for access to be granted:
 |---|---|
 | API Framework | FastAPI + Uvicorn |
 | Speaker Verification | SpeechBrain ECAPA-TDNN (192-dim embeddings) |
-| Speech-to-Text | OpenAI Whisper (large-v3) |
+| Speech-to-Text (English) | OpenAI Whisper (large-v3) |
+| Speech-to-Text (Swahili) | w2v-BERT 2.0 (`badrex/w2v-bert-2.0-swahili-as`) |
 | Text-to-Speech | gTTS |
 | Homomorphic Encryption | python-paillier (2048-bit Paillier) |
 | Digital Signatures | PyNaCl (Ed25519) |
@@ -243,7 +244,8 @@ Key parameters:
 | `MATCH_THRESHOLD` | 0.45 | Cosine similarity threshold for voice match |
 | `TRANSCRIPT_MATCH_THRESHOLD` | 0.75 | Word-level similarity threshold for phrase 2FA |
 | `PAILLIER_BITS` | 2048 | Paillier key size |
-| `WHISPER_MODEL` | large-v3 | Whisper ASR model |
+| `WHISPER_MODEL` | large-v3 | Whisper ASR model (English) |
+| `SWAHILI_ASR_MODEL` | badrex/w2v-bert-2.0-swahili-as | w2v-BERT ASR model (Swahili) |
 | `ECAPA_SOURCE` | speechbrain/spkrec-ecapa-voxceleb | Speaker embedding model |
 | `ENROLLMENT_PHRASES` | 5 | Number of voice samples for enrollment |
 | `ESIGNET_BASE_URL` | *(env)* | MOSIP e-Signet server URL |
@@ -271,6 +273,20 @@ To test the phone-based IVR flow:
 - **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.3.0 (2026-04-02)
+
+**New Features**
+- **Dual ASR: w2v-BERT for Swahili, Whisper for English** -- `TranscriptionService` now routes Swahili (`language="sw"`) to `badrex/w2v-bert-2.0-swahili-as` (a fine-tuned w2v-BERT 2.0 CTC model that outperforms Whisper large-v3 on Swahili speech) and keeps Whisper large-v3 for English and all other languages. Both models are lazy-loaded singletons. Applies to all flows: authentication, consent, and service access — in both IVR and Streamlit (`app/services/transcription_service.py`, `app/config.py`)
+
+**Files Changed**
+| File | Change |
+|---|---|
+| `app/services/transcription_service.py` | Rewritten with dual backend: `_transcribe_whisper()` + `_transcribe_swahili()`, auto-routed by language |
+| `app/config.py` | Added `SWAHILI_ASR_MODEL` setting (default: `badrex/w2v-bert-2.0-swahili-as`) |
+| `README.md` | Updated tech stack, config table, auth flow description, changelog |
+| `VeriVoice_PRD.md` | Updated ASR references for dual-model architecture |
+| `docs/Twilio_IVR_Setup&Docs.md` | Updated auth walkthrough to mention language-specific ASR |
 
 ### v1.2.1 (2026-04-02)
 

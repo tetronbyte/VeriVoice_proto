@@ -159,9 +159,11 @@ Authentication proceeds in two stages:
     The homomorphic dot product is decrypted and compared against a
     configurable threshold (default: 0.45).
 
-2.  **Phrase Transcript Match:** Whisper ASR (large-v3) transcribes the
-    spoken audio into text. The transcription is compared against the
-    original challenge phrase to verify the user said the correct words.
+2.  **Phrase Transcript Match:** The spoken audio is transcribed using
+    the language-appropriate ASR model — Whisper large-v3 for English,
+    w2v-BERT 2.0 (`badrex/w2v-bert-2.0-swahili-as`) for Swahili. The
+    transcription is compared against the original challenge phrase to
+    verify the user said the correct words.
 
 Both stages must pass for the authentication to be granted.
 
@@ -178,7 +180,8 @@ then generates a cryptographically signed consent token using Ed25519
 
 After authentication and consent, the user accesses a simulated health
 insurance form. The system uses gTTS to play each question's audio and
-Whisper ASR for speech-to-text to capture the user's spoken answers.
+the language-appropriate ASR model (Whisper for English, w2v-BERT for
+Swahili) for speech-to-text to capture the user's spoken answers.
 Voice re-authentication is performed once at the start of the session
 (not per reply). The form responses are captured and stored.
 
@@ -196,7 +199,8 @@ Voice re-authentication is performed once at the start of the session
 
 -   HE-encrypted voice matching with cosine similarity scoring
 
--   Whisper ASR (large-v3) for speech-to-text transcription
+-   Dual ASR: Whisper large-v3 for English, w2v-BERT 2.0
+    (`badrex/w2v-bert-2.0-swahili-as`) for Swahili speech-to-text
 
 -   gTTS for text-to-speech playback (challenge phrases, consent text,
     form questions)
@@ -267,8 +271,8 @@ pipeline as above → citizen record marked identity_verified=True
 
 Authentication: Audio capture → Preprocessing → ECAPA-TDNN (192-dim
 embedding) → L2-normalise → HE scalar multiply with stored ciphertext →
-Decrypt dot product → Score vs. threshold + Whisper ASR transcript vs.
-challenge phrase → Verdict
+Decrypt dot product → Score vs. threshold + ASR transcript (Whisper for
+English, w2v-BERT for Swahili) vs. challenge phrase → Verdict
 
 MOSIP e-Signet Identity Verification: VeriVoice redirects to e-Signet
 /authorize → citizen authenticates via MOSIP biometrics (SBI device /
@@ -279,7 +283,7 @@ code for id_token → validates JWT → extracts verified sub
 Consent: gTTS plays consent text → User speaks response → Voice auth
 pipeline → Ed25519 sign consent token → Store token
 
-Service Access: gTTS plays form questions → Whisper ASR transcribes
+Service Access: gTTS plays form questions → ASR transcribes
 answers → Store responses
 
 7.2 Tech Stack (Prototype)
@@ -300,8 +304,8 @@ answers → Store responses
   **Speaker             ECAPA-TDNN via SpeechBrain
   Verification**        (speechbrain/spkrec-ecapa-voxceleb)
 
-  **Speech-to-Text      OpenAI Whisper (large-v3)
-  (ASR)**               
+  **Speech-to-Text      OpenAI Whisper large-v3 (English);
+  (ASR)**               w2v-BERT 2.0 badrex/w2v-bert-2.0-swahili-as (Swahili)
 
   **Text-to-Speech      gTTS (Google Text-to-Speech)
   (TTS)**               
@@ -397,7 +401,7 @@ service modules.
 │ │ ├── matching_service.py \# MatchingService (HE dot product +
 threshold)
 
-│ │ ├── transcription_service.py \# TranscriptionService (Whisper ASR)
+│ │ ├── transcription_service.py \# TranscriptionService (Whisper + w2v-BERT)
 
 │ │ ├── tts_service.py \# TTSService (gTTS wrapper)
 
@@ -582,24 +586,29 @@ and the stored encrypted centroid, then decrypts and scores.
 
 9.5 TranscriptionService
 
-Wraps OpenAI Whisper for converting spoken audio into text. Used for
-both the challenge phrase transcript match and for capturing form
-answers during service access.
+Dual-backend ASR service that routes to the best model for the detected
+language. Used for both the challenge phrase transcript match and for
+capturing form answers during service access.
 
   --------------------- -------------------------------------------------
   **Property**          Detail
 
-  **Model**             Whisper large-v3
+  **English Model**     OpenAI Whisper large-v3
 
-  **Input**             Audio file path or numpy array
+  **Swahili Model**     w2v-BERT 2.0 (badrex/w2v-bert-2.0-swahili-as) —
+                        CTC model fine-tuned on Swahili speech, outperforms
+                        Whisper large-v3 on Swahili
+
+  **Routing**           language="sw" → w2v-BERT; all other languages → Whisper
+
+  **Input**             Audio file path or numpy array (16 kHz, mono, float32)
 
   **Output**            Transcribed text string
 
   **Use Cases**         Challenge phrase verification, consent response
                         capture, form answer capture
 
-  **Language Support**  Auto-detect or specify (e.g., "sw" for Swahili,
-                        "en" for English)
+  **Singleton**         Both models are lazy-loaded on first use and reused
   --------------------- -------------------------------------------------
 
 9.6 TTSService
@@ -774,8 +783,8 @@ POST /api/v1/authenticate
 
   **Processing**        1\. Retrieve stored HE ciphertext 2. Preprocess
                         audio 3. Extract ECAPA-TDNN embedding 4. HE match
-                        (scalar multiply + decrypt) 5. Whisper ASR
-                        transcribe 6. Compare transcript vs. challenge
+                        (scalar multiply + decrypt) 5. ASR transcribe
+                        (Whisper/w2v-BERT) 6. Compare transcript vs. challenge
                         phrase 7. Both must pass
 
   **Response**          {event_id, voice_match_score, transcript_match:
@@ -806,7 +815,7 @@ POST /api/v1/consent
                         multipart)
 
   **Processing**        1\. Voice auth pipeline (verify speaker) 2.
-                        Whisper ASR to confirm "Yes" / affirmative 3.
+                        ASR (Whisper/w2v-BERT) to confirm "Yes" / affirmative 3.
                         Ed25519 sign consent payload 4. Store
                         CONSENT_TOKEN
 
@@ -826,7 +835,7 @@ POST /api/v1/service-access
                         audio_file (1 audio file per question, multipart)
 
   **Processing**        1\. Verify valid consent token 2. gTTS generates
-                        question audio 3. Whisper ASR transcribes user
+                        question audio 3. ASR (Whisper/w2v-BERT) transcribes user
                         answer 4. Store response
 
   **Response**          {form_id, question, transcribed_answer, status}
@@ -1168,8 +1177,9 @@ AudioPreprocessor class and has been independently tested.
     product). The private key decrypts the result. The cosine similarity
     score is compared against the threshold (default 0.45).
 
-28. Stage 2 --- Phrase Transcript Match: Whisper ASR (large-v3)
-    transcribes the same audio. The transcription is normalised
+28. Stage 2 --- Phrase Transcript Match: The same audio is transcribed
+    using the language-appropriate ASR model (Whisper large-v3 for English,
+    w2v-BERT 2.0 for Swahili). The transcription is normalised
     (lowercase, stripped punctuation) and compared against the expected
     challenge phrase.
 
@@ -1189,7 +1199,8 @@ AudioPreprocessor class and has been independently tested.
 34. System runs the full voice auth pipeline on the response audio to
     verify the speaker.
 
-35. Whisper ASR transcribes the response to confirm affirmative consent.
+35. ASR (Whisper or w2v-BERT, based on language) transcribes the response
+    to confirm affirmative consent.
 
 36. ConsentService signs the consent payload (citizen_id, ministry_code,
     data_scope, timestamp) using Ed25519.
@@ -1205,8 +1216,8 @@ AudioPreprocessor class and has been independently tested.
 
 40. Voice authentication is performed once at the start of the session.
 
-41. For each form question: gTTS generates the question audio, Whisper
-    ASR transcribes the citizen's spoken answer.
+41. For each form question: gTTS generates the question audio, ASR
+    (Whisper or w2v-BERT) transcribes the citizen's spoken answer.
 
 42. Transcribed answers are stored and associated with the form session.
 
@@ -1229,7 +1240,8 @@ hackathon demo:
 45. **Authentication:** Citizen "calls" the system (Twilio IVR or
     Streamlit upload). System plays a random challenge phrase. Citizen
     speaks the phrase. System performs voice biometric match + phrase
-    transcript match. Result: "granted" or "denied."
+    transcript match (Whisper for English, w2v-BERT for Swahili).
+    Result: "granted" or "denied."
 
 46. **Consent:** System reads consent text (gTTS). Citizen says "Yes."
     System verifies speaker + transcription. Signed consent token
@@ -1237,7 +1249,8 @@ hackathon demo:
     available.
 
 47. **Service Access:** System plays health insurance form questions
-    (gTTS). Citizen answers verbally. Whisper ASR transcribes answers.
+    (gTTS). Citizen answers verbally. ASR transcribes answers
+    (Whisper for English, w2v-BERT for Swahili).
     Form completed.
 
 16\. Configuration & Thresholds
@@ -1256,7 +1269,9 @@ hackathon demo:
 
   **ECAPA_SOURCE**          speechbrain/spkrec-ecapa-voxceleb
 
-  **WHISPER_MODEL**         large-v3
+  **WHISPER_MODEL**         large-v3 (English ASR)
+
+  **SWAHILI_ASR_MODEL**     badrex/w2v-bert-2.0-swahili-as (Swahili ASR)
 
   **GSM_ENFORCE**           False (default: 80 Hz highpass; True: 300--3400
                             Hz bandpass)
@@ -1311,7 +1326,9 @@ prototype (requirements.txt):
 
   torchaudio            Audio processing       Audio tensor operations
 
-  openai-whisper        Speech-to-text         Whisper large-v3 ASR
+  openai-whisper        Speech-to-text         Whisper large-v3 ASR (English)
+
+  transformers          Speech-to-text         w2v-BERT 2.0 ASR (Swahili)
 
   gTTS                  Text-to-speech         Google TTS for audio
                                                generation
@@ -1428,8 +1445,9 @@ prototype:
 -   **AfroDigits Dataset:** Integrate AfroDigits for improved noise
     filtering and African-language audio preprocessing.
 
--   **MakerereNLP ASR:** Evaluate MakerereNLP models for improved
-    African language speech recognition.
+-   **MakerereNLP ASR:** Evaluate MakerereNLP models for additional
+    African languages beyond Swahili (Swahili is now served by
+    w2v-BERT 2.0 in the prototype).
 
 -   **Anti-Spoofing:** Implement deepfake detection and replay attack
     prevention.
