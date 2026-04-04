@@ -111,11 +111,15 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 | Endpoint | Description |
 |---|---|
 | `/twilio/voice/welcome` | Welcome + language selection |
-| `/twilio/voice/enroll` | 5 random-phrase enrollment via `<Record>` |
-| `/twilio/voice/authenticate` | Challenge phrase auth |
+| `/twilio/voice/enroll` | National ID input + 5 random-phrase enrollment via `<Record>` |
+| `/twilio/voice/authenticate` | National ID input + challenge phrase + real auth pipeline (1 retry on denied) |
 | `/twilio/voice/consent` | Verbal consent recording |
 | `/twilio/voice/service` | Health insurance form Q&A (3 questions + read-back) |
 | `/twilio/voice/service/confirm` | Yes/no confirmation after TTS summary |
+
+**Full call continuity:** After successful authentication, the IVR stays in the same call and flows through consent → service access (health insurance form) → summary → goodbye. On auth denial, the caller gets one retry; if denied again, the call ends.
+
+**IVR authentication pipeline:** The IVR auth callback downloads the Twilio recording, runs the full dual-stage pipeline (ECAPA-TDNN voice biometric match + Whisper/w2v-BERT transcript match), announces the score, and routes accordingly. This is the same pipeline used by the REST API `POST /api/v1/authenticate`.
 
 All IVR voice recordings use **keypad # to stop** (silence detection is disabled). The caller hears a beep, speaks, and presses `#` when done. This gives callers explicit control and prevents mid-sentence cutoffs.
 
@@ -275,6 +279,28 @@ To test the phone-based IVR flow:
 - **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.4.0 (2026-04-04)
+
+**New Features**
+- **Live IVR authentication pipeline** -- IVR auth callback now downloads the Twilio recording, runs the full dual-stage authentication pipeline (ECAPA-TDNN voice biometric match + Whisper/w2v-BERT transcript match), and announces the result to the caller with their voice score. Replaces the previous prototype placeholder that always said "Authentication complete" (`twilio_integration/webhook_handler.py`)
+- **IVR national ID input for authentication** -- Authentication flow now prompts the caller to enter their national ID via keypad before the challenge phrase, enabling citizen lookup and voice template retrieval (`twilio_integration/webhook_handler.py`)
+- **Full call continuity** -- After successful authentication, the IVR stays in the same call and flows: auth granted → available services announcement → consent recording → health insurance form (3 questions) → TTS read-back summary → confirmation → goodbye. No more hanging up between stages (`twilio_integration/webhook_handler.py`)
+- **Auth retry on denial** -- If authentication is denied, the caller gets one retry with a new challenge phrase. If denied again, the call ends with a goodbye message (`twilio_integration/webhook_handler.py`)
+- **Twilio recording download** -- New `_download_twilio_recording()` async helper downloads recorded audio from Twilio's servers with Basic Auth (`twilio_integration/webhook_handler.py`)
+- **citizen_id propagation** -- The authenticated citizen's UUID is passed through query params across consent and service access endpoints, maintaining identity context throughout the entire call (`twilio_integration/webhook_handler.py`)
+
+**Fixes**
+- **Streamlit JSON decode error** -- Error handlers for non-success API responses now gracefully handle empty or non-JSON response bodies instead of crashing with `JSONDecodeError` (`streamlit_app/app.py`)
+
+**Files Changed**
+| File | Change |
+|---|---|
+| `twilio_integration/webhook_handler.py` | Rewrote auth flow with real pipeline, national ID gather, retry logic, call continuity; added `_download_twilio_recording()`; added `citizen_id` param to consent and service endpoints; added detailed print logging |
+| `streamlit_app/app.py` | Wrapped `resp.json()` in try/except for all 5 error handlers |
+| `README.md` | Updated IVR webhook table, added call continuity docs, changelog |
+| `VeriVoice_PRD.md` | Updated IVR auth flow, demo flow, Twilio integration sections |
+| `docs/Twilio_IVR_Setup&Docs.md` | Updated auth walkthrough, webhook reference, state machine, troubleshooting |
 
 ### v1.3.1 (2026-04-02)
 

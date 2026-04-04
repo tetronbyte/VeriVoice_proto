@@ -399,9 +399,18 @@ The call ends (hangup).
 
 She goes through the welcome flow (Phase 1) and this time presses **2** to authenticate.
 
-**Step 1 — Challenge phrase played**
+**Step 1 — Enter national ID**
 
 Twilio POSTs to: `POST /twilio/voice/authenticate?lang=en`
+
+The system plays:
+> "Please enter your national ID number followed by the pound key."
+
+Amina types her national ID on the keypad: `29384756#`
+
+**Step 2 — Challenge phrase played**
+
+Twilio POSTs to: `POST /twilio/voice/authenticate?lang=en&attempt=0` with `Digits=29384756`
 
 The backend generates a random challenge phrase from the pool:
 > "Please say the following phrase: The market opens early on Wednesday."
@@ -410,9 +419,9 @@ A `challenge_id` (UUID) is generated and stored in memory.
 
 *\[Beep\]* — Amina speaks the phrase. She presses **#** on her keypad. Twilio ends the recording and POSTs the `RecordingUrl` to the callback.
 
-**Step 2 — Authentication callback**
+**Step 3 — Authentication callback (real pipeline)**
 
-Twilio POSTs to: `POST /twilio/voice/authenticate/callback?lang=en&challenge_id=<uuid>` with `RecordingUrl=https://api.twilio.com/...`
+Twilio POSTs to: `POST /twilio/voice/authenticate/callback?lang=en&challenge_id=<uuid>&national_id=29384756&attempt=0` with `RecordingUrl=https://api.twilio.com/...`
 
 The system plays:
 > "Your voice is being processed. Please wait."
@@ -421,13 +430,14 @@ The system plays:
 
 **Factor 1 — Voice Biometric Match:**
 
-1. Recording is downloaded from Twilio and preprocessed
-2. ECAPA-TDNN extracts a live 192-dim embedding
-3. The stored HE-encrypted centroid is loaded from the database
-4. An HE dot product is computed between the live embedding and encrypted centroid
-5. The result is decrypted with the Paillier private key
-6. The cosine similarity score is compared against the threshold (0.45)
-7. The live embedding is zeroed from memory
+1. Recording is downloaded from Twilio (authenticated request with TWILIO_ACCOUNT_SID/AUTH_TOKEN)
+2. Audio is preprocessed (16 kHz, VAD, noise reduction, normalization)
+3. ECAPA-TDNN extracts a live 192-dim embedding
+4. Citizen is looked up by national ID; stored HE-encrypted centroid is loaded
+5. An HE dot product is computed between the live embedding and encrypted centroid
+6. The result is decrypted with the Paillier private key
+7. The cosine similarity score is compared against the threshold (0.45)
+8. The live embedding is zeroed from memory
 
 **Factor 2 — Transcript Match (2FA):**
 
@@ -445,31 +455,41 @@ The system plays:
    - The threshold is **75%** (configurable via `TRANSCRIPT_MATCH_THRESHOLD`)
    - Example: expected has 8 words, ASR gets 6 correct = 75% = pass
 
-**Decision:** Both factors must pass. The result (`granted` or `denied`) is logged in the `AUTH_EVENT` table.
+**Decision:** Both factors must pass. The result (`granted` or `denied`) is logged in the `AUTH_EVENT` table. The voice score is announced to the caller.
 
-After processing:
-> "Authentication complete. Thank you."
+**If GRANTED:**
+> "Access granted. Your voice score is 0.87. Available services: Health Insurance Form. You will now be directed to consent."
 
-The call ends.
+The call **continues** (no hangup) — Amina is redirected to the consent flow.
+
+**If DENIED (first attempt):**
+> "Access denied. Your voice score is 0.32. Please try again."
+
+Amina gets a second attempt with a new challenge phrase.
+
+**If DENIED (second attempt):**
+> "Access denied again. Please try again later. Goodbye."
+
+The call ends (hangup).
 
 ---
 
-### Phase 4: Consent
+### Phase 4: Consent (same call, after auth granted)
 
-After successful authentication, the system can redirect Amina to record verbal consent for data sharing.
+After successful authentication, the IVR stays in the same call and redirects Amina to record verbal consent for data sharing.
 
 **Step 1 — Consent text played**
 
-Twilio POSTs to: `POST /twilio/voice/consent?lang=en`
+Twilio POSTs to: `POST /twilio/voice/consent?lang=en&citizen_id=<uuid>`
 
 The system reads the consent statement:
 > "I consent to share my health records with the Ministry of Health. Say Yes to agree."
 
 *\[Beep\]* — Amina says "Yes, I agree." She presses **#**. Twilio ends the recording.
 
-**Step 2 — Consent callback**
+**Step 2 — Consent callback → redirect to service access**
 
-Twilio POSTs to: `POST /twilio/voice/consent/callback?lang=en` with `RecordingUrl=https://api.twilio.com/...`
+Twilio POSTs to: `POST /twilio/voice/consent/callback?lang=en&citizen_id=<uuid>` with `RecordingUrl=https://api.twilio.com/...`
 
 **What happens behind the scenes:**
 
@@ -479,15 +499,15 @@ Twilio POSTs to: `POST /twilio/voice/consent/callback?lang=en` with `RecordingUr
 4. No raw audio is stored — only the cryptographic proof of consent
 
 The system plays:
-> "Your consent has been recorded. Thank you."
+> "Your consent has been recorded. You will now be directed to the Health Insurance Form."
 
-The call ends.
+The call **continues** — Amina is redirected to the service access flow (no hangup).
 
 ---
 
-### Phase 5: Service Access (Health Insurance Form)
+### Phase 5: Service Access — Health Insurance Form (same call, after consent)
 
-After consent is granted, Amina is redirected to the voice-driven health insurance form. The form asks **3 questions**, each designed to demonstrate a different ASR capability, followed by a **TTS read-back summary** for confirmation.
+After consent is recorded, the IVR stays in the same call and redirects Amina to the voice-driven health insurance form. The form asks **3 questions**, each designed to demonstrate a different ASR capability, followed by a **TTS read-back summary** for confirmation.
 
 **Step 1 — Question 1: Full Name (string capture)**
 
@@ -586,13 +606,13 @@ All endpoints are mounted under the `/twilio` prefix and return TwiML XML.
 | `/twilio/voice/welcome/action` | POST | Route to enroll or authenticate | `Digits` (form), `lang` (query) |
 | `/twilio/voice/enroll` | POST | National ID input or play random phrase + record | `lang`, `step`, `national_id` (query) |
 | `/twilio/voice/enroll/callback` | POST | Handle completed enrollment recording | `RecordingUrl` (form), `lang`, `step`, `national_id` (query) |
-| `/twilio/voice/authenticate` | POST | Play challenge phrase + record | `lang` (query) |
-| `/twilio/voice/authenticate/callback` | POST | Process auth recording | `RecordingUrl` (form), `lang`, `challenge_id` (query) |
-| `/twilio/voice/consent` | POST | Read consent text + record | `lang` (query) |
-| `/twilio/voice/consent/callback` | POST | Process consent recording | `RecordingUrl` (form), `lang` (query) |
-| `/twilio/voice/service` | POST | Play form question or TTS read-back summary | `lang`, `question_index`, `full_name`, `dependants`, `primary_facility` (query) |
-| `/twilio/voice/service/callback` | POST | Process form answer, advance to next question | `RecordingUrl` (form), `lang`, `question_index`, `full_name`, `dependants`, `primary_facility` (query) |
-| `/twilio/voice/service/confirm` | POST | Handle yes/no confirmation after read-back | `RecordingUrl` (form), `lang`, `full_name`, `dependants`, `primary_facility` (query) |
+| `/twilio/voice/authenticate` | POST | National ID input + challenge phrase + record | `lang`, `national_id`, `attempt` (query) |
+| `/twilio/voice/authenticate/callback` | POST | Download recording, run full auth pipeline, announce result, route to consent or retry | `RecordingUrl` (form), `lang`, `challenge_id`, `national_id`, `attempt` (query) |
+| `/twilio/voice/consent` | POST | Read consent text + record | `lang`, `citizen_id` (query) |
+| `/twilio/voice/consent/callback` | POST | Process consent recording, redirect to service access | `RecordingUrl` (form), `lang`, `citizen_id` (query) |
+| `/twilio/voice/service` | POST | Play form question or TTS read-back summary | `lang`, `question_index`, `citizen_id`, `full_name`, `dependants`, `primary_facility` (query) |
+| `/twilio/voice/service/callback` | POST | Process form answer, advance to next question | `RecordingUrl` (form), `lang`, `question_index`, `citizen_id`, `full_name`, `dependants`, `primary_facility` (query) |
+| `/twilio/voice/service/confirm` | POST | Handle yes/no confirmation after read-back | `RecordingUrl` (form), `lang`, `citizen_id`, `full_name`, `dependants`, `primary_facility` (query) |
 
 ### Related REST API Endpoints (Non-IVR)
 
@@ -629,44 +649,65 @@ WELCOME
                         |                           v
                         |                     ENROLL_COMPLETE --> Hangup
                         |
-                        +-- (Press 2) --> AUTH_CHALLENGE
+                        +-- (Press 2) --> AUTH_NATIONAL_ID
+                                              |
+                                              +-- Enter national ID (#)
+                                              |
+                                              v
+                                         AUTH_CHALLENGE
                                               |
                                               +-- Play challenge phrase
                                               +-- [Beep] Record response --> presses #
-                                                    |
-                                                    v
-                                              AUTH_RESULT --> Hangup
-                                                    |
-                                                    +-- (if granted) --> CONSENT_PROMPT
-                                                    |                       |
-                                                    |                       +-- [Beep] Record --> presses #
-                                                    |                       |
-                                                    |                       v
-                                                    |                  CONSENT_RESULT
-                                                    |                       |
-                                                    |                       v
-                                                    |                  SERVICE_QUESTION (x3)
-                                                    |                       |
-                                                    |                       +-- Q1: "Full name?"
-                                                    |                       |   [Beep] --> speak --> presses #
-                                                    |                       |
-                                                    |                       +-- Q2: "How many dependants?"
-                                                    |                       |   [Beep] --> speak --> presses #
-                                                    |                       |
-                                                    |                       +-- Q3: "Which facility?"
-                                                    |                           [Beep] --> speak --> presses #
-                                                    |                           |
-                                                    |                           v
-                                                    |                  TTS READ-BACK SUMMARY
-                                                    |                  "Your name is X, Y dependants, facility Z.
-                                                    |                   Is this correct?"
-                                                    |                       |
-                                                    |                       +-- [Beep] --> "Yes" --> presses #
-                                                    |                       |
-                                                    |                       v
-                                                    |                  SERVICE_COMPLETE --> Hangup
-                                                    |
-                                                    +-- (if denied) --> Hangup
+                                              |
+                                              v
+                                         AUTH_PIPELINE (download + process)
+                                              |  Voice biometric match (ECAPA-TDNN + HE)
+                                              |  Transcript match (Whisper/w2v-BERT)
+                                              |  Score announced to caller
+                                              |
+                                              +-- (if GRANTED) ─────��────────────────────┐
+                                              |                                          |
+                                              +-- (if DENIED, attempt 1)                 |
+                                              |       |                                  |
+                                              |       v                                  |
+                                              |   "Try again" --> AUTH_CHALLENGE          |
+                                              |       |                                  |
+                                              |       +-- (if DENIED, attempt 2)         |
+                                              |               |                          |
+                                              |               v                          |
+                                              |           Hangup                         |
+                                              |                                          |
+                                              v                                          |
+                                         CONSENT_PROMPT  <───────────────────────────────┘
+                                              |  (same call, no hangup)
+                                              |
+                                              +-- [Beep] Record consent --> presses #
+                                              |
+                                              v
+                                         CONSENT_RECORDED
+                                              |  "Redirecting to Health Insurance Form"
+                                              |
+                                              v
+                                         SERVICE_QUESTION (x3, same call)
+                                              |
+                                              +-- Q1: "Full name?"
+                                              |   [Beep] --> speak --> presses #
+                                              |
+                                              +-- Q2: "How many dependants?"
+                                              |   [Beep] --> speak --> presses #
+                                              |
+                                              +-- Q3: "Which facility?"
+                                                  [Beep] --> speak --> presses #
+                                                  |
+                                                  v
+                                             TTS READ-BACK SUMMARY
+                                             "Your name is X, Y dependants, facility Z.
+                                              Is this correct?"
+                                                  |
+                                                  +-- [Beep] --> "Yes" --> presses #
+                                                  |
+                                                  v
+                                             SERVICE_COMPLETE --> Hangup
 ```
 
 ## 12. Testing the IVR Locally
@@ -704,8 +745,12 @@ curl -X POST "http://localhost:8000/twilio/voice/welcome/action?lang=en" \
 # Test enrollment prompt (national ID step)
 curl -X POST "http://localhost:8000/twilio/voice/enroll?lang=en&step=0"
 
-# Test authentication (generates a challenge phrase)
+# Test authentication — national ID prompt
 curl -X POST "http://localhost:8000/twilio/voice/authenticate?lang=en"
+
+# Test authentication — after entering national ID (generates challenge phrase)
+curl -X POST "http://localhost:8000/twilio/voice/authenticate?lang=en&attempt=0" \
+  -d "Digits=29384756"
 
 # Test service access question 1
 curl -X POST "http://localhost:8000/twilio/voice/service?lang=en&question_index=0"
@@ -906,7 +951,9 @@ This test takes ~90 seconds (loads ECAPA-TDNN + Whisper models) and verifies:
 | Recording ends too early | Caller hit maxLength before pressing # | Increase `maxLength` in `<Record>` or remind caller to press # promptly |
 | Recording cuts off long answers | `maxLength` is too short | Increase `maxLength` (currently 15s for form answers, 10s for enrollment) |
 | Caller confused about when to speak | No beep or unclear prompt | Ensure `playBeep="true"` is set; consider adding "speak after the beep" to prompts |
-| Enrollment says complete but no voiceprint stored | Prototype callback doesn't download recordings yet | This is expected in the prototype — the callback flow is wired, but full processing requires production deployment |
+| Auth says "Citizen not found" | National ID entered via keypad doesn't match any enrolled citizen | Verify the citizen was enrolled first; check the national ID was entered correctly (digits only, no dashes) |
+| Auth always denied | Voice score below 0.45 threshold or transcript doesn't match | Check backend logs for exact scores; ensure the caller speaks the challenge phrase clearly; recording quality may be poor over phone |
+| Auth callback takes a long time | ECAPA-TDNN + Whisper models loading for the first time | First auth call loads ML models (~30s). Subsequent calls are fast. Twilio may time out; increase `max_length` if needed |
 | ngrok URL changed | Free ngrok assigns a new URL on each restart | Update the Twilio webhook URL, or use a paid ngrok plan for a stable subdomain |
 | Swahili prompts not playing | `PUBLIC_BASE_URL` doesn't match your ngrok URL | Set `PUBLIC_BASE_URL` in `.env` to your current ngrok URL (e.g., `https://a1b2c3d4.ngrok-free.app`). Twilio fetches gTTS audio from this URL |
 | Swahili audio sounds robotic | gTTS quality is lower than commercial TTS | Expected — gTTS is free-tier Google Translate TTS. Quality is acceptable for a prototype and far better than Twilio `alice` mispronouncing Swahili |
@@ -942,19 +989,26 @@ Amina dials +1234567890
 Amina calls again, selects English, presses 2
   |
   v
+"Enter your national ID followed by #."              --> Types 29384756#
+  |
+  v
 "Please say: The market opens early on Wednesday."   --> [Beep] Speaks --> presses #
   |
   v
-Voice biometric: 0.87 (pass) + Transcript: 87.5% (pass)
+Backend downloads recording, runs full auth pipeline:
+  Voice biometric: 0.87 (pass) + Transcript: 87.5% (pass)
   |
   v
-"Authentication complete."                           --> Redirected to consent
+"Access granted. Your voice score is 0.87.           --> (same call continues)
+ Available services: Health Insurance Form.
+ You will now be directed to consent."
   |
   v
 "I consent to share my health records..."            --> [Beep] "Yes" --> presses #
   |
   v
-"Your consent has been recorded."                    --> Redirected to service
+"Your consent has been recorded. You will now        --> (same call continues)
+ be directed to the Health Insurance Form."
   |
   v
 "Please say your full name."                         --> [Beep] "Amina Juma Ochieng" --> presses #

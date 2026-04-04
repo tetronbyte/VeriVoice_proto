@@ -1238,20 +1238,25 @@ hackathon demo:
     was used, enrollment is identity-verified.
 
 45. **Authentication:** Citizen "calls" the system (Twilio IVR or
-    Streamlit upload). System plays a random challenge phrase. Citizen
-    speaks the phrase. System performs voice biometric match + phrase
-    transcript match (Whisper for English, w2v-BERT for Swahili).
-    Result: "granted" or "denied."
+    Streamlit upload). In the IVR flow, the citizen first enters their
+    national ID via keypad. The system plays a random challenge phrase.
+    Citizen speaks the phrase. System downloads the recording and
+    performs the full dual-stage authentication: voice biometric match
+    (ECAPA-TDNN + Paillier HE dot product) + phrase transcript match
+    (Whisper for English, w2v-BERT for Swahili). The voice score is
+    announced to the caller. Result: "granted" or "denied." If denied,
+    the caller gets one retry with a new challenge phrase; if denied
+    again, the call ends.
 
-46. **Consent:** System reads consent text (gTTS). Citizen says "Yes."
-    System verifies speaker + transcription. Signed consent token
-    generated and stored. Token references MOSIP-verified identity when
-    available.
+46. **Consent (same call):** Upon successful authentication, the IVR
+    stays in the same call and announces available services (Health
+    Insurance Form). System reads consent text (gTTS). Citizen says
+    "Yes." Consent is recorded. The call continues to service access.
 
-47. **Service Access:** System plays health insurance form questions
-    (gTTS). Citizen answers verbally. ASR transcribes answers
-    (Whisper for English, w2v-BERT for Swahili).
-    Form completed.
+47. **Service Access (same call):** System plays health insurance form
+    questions (gTTS). Citizen answers verbally. ASR transcribes answers
+    (Whisper for English, w2v-BERT for Swahili). After all 3 questions,
+    TTS reads back a summary for confirmation. Form completed. Call ends.
 
 16\. Configuration & Thresholds
 
@@ -1388,6 +1393,14 @@ starts), speaks their response, and presses \# on the keypad to end the
 recording. Silence detection is disabled (timeout=0) to prevent
 mid-sentence cutoffs from pauses. A bilingual prompt ("Press pound when
 you are done" / "Bonyeza # ukimaliza") plays before each recording.
+
+The IVR authentication callback downloads the recording from Twilio's
+servers (using Basic Auth with TWILIO_ACCOUNT_SID/AUTH_TOKEN), then runs
+the full dual-stage authentication pipeline — the same pipeline used by
+the REST API. Upon success, the call continues seamlessly through
+consent and service access without hanging up. On denial, the caller
+gets one retry; a second denial ends the call. The citizen_id is
+propagated through all subsequent IVR steps via URL query parameters.
 
 IVR TTS strategy varies by language: English prompts use Twilio's built-in
 \<Say voice="alice"\> (rendered inline with zero latency). Swahili prompts
