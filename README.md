@@ -15,7 +15,8 @@ Enrollment:     5 voice samples -> ECAPA-TDNN (192-dim) -> Paillier HE encrypt -
                 -> linked to verified mosip_individual_id
 Authentication: voice + phrase -> biometric match (HE dot product) + Whisper ASR transcript check
 Consent:        voice auth -> Ed25519 sign consent token -> store in DB
-Service Access: verify consent token -> voice Q&A via Whisper ASR
+Service Access: pick 1 of 5 services via DTMF -> 3 questions + read-back
+                -> yes persists SERVICE_FORM, no triggers per-question correction
 ```
 
 **Key privacy property:** Raw audio is never stored. Only homomorphically encrypted embeddings are persisted. Plaintext vectors are zeroed from memory immediately after encryption.
@@ -118,13 +119,15 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 | `/twilio/voice/verify/otp` | Verify OTP via eSignet, redirect to enrollment |
 | `/twilio/voice/enroll` | National ID input + 5 random-phrase enrollment via `<Record>` |
 | `/twilio/voice/authenticate` | National ID input + challenge phrase + real auth pipeline (1 retry on denied) |
-| `/twilio/voice/consent` | Verbal consent recording |
-| `/twilio/voice/service` | Health insurance form Q&A (3 questions + read-back) |
-| `/twilio/voice/service/confirm` | Yes/no confirmation after TTS summary |
+| `/twilio/voice/consent` | Verbal consent recording (Yes/No → Ed25519-signs + persists CONSENT_TOKEN) |
+| `/twilio/voice/service/menu` | 5-service menu (pension / mpesa / aid / sim swap / telemedicine) via DTMF 1-5 |
+| `/twilio/voice/service` | 3 questions + read-back for the chosen `service_code` |
+| `/twilio/voice/service/confirm` | Yes/No confirmation: "yes" persists SERVICE_FORM + announces reference ID; "no" → correction flow |
+| `/twilio/voice/service/correct` | Asks "which question — 1/2/3?" after "no" at read-back, re-asks only that single question |
 
 **IVR identity verification (DTMF):** From the main menu, pressing **3** starts an eSignet-backed identity check using only the phone keypad. The IVR prompts for the national ID, calls eSignet's server-driven OAuth (`oauth-details` → `send-otp` → `authenticate` → `auth-code` → token), and extracts a verified MOSIP `individual_id` from the signed id_token. On success the call proceeds directly into voice enrollment, and the new `CITIZEN` row is created with `mosip_individual_id` + `identity_verified=True`. No SMS, no browser, no public URLs for eSignet — the whole flow happens on the call. See `docs/ivr_verify_flow.md`.
 
-**Full call continuity:** After successful authentication, the IVR stays in the same call and flows through consent → service access (health insurance form) → summary → goodbye. On auth denial, the caller gets one retry; if denied again, the call ends.
+**Full call continuity:** After successful authentication, the IVR stays in the same call and flows through consent → service menu (DTMF 1-5) → 3 questions for the chosen service → TTS read-back → Yes/No confirmation → (optional per-question correction) → persist + announce reference ID → goodbye. On auth denial, the caller gets one retry; if denied again, the call ends.
 
 **IVR authentication pipeline:** The IVR auth callback downloads the Twilio recording, runs the full dual-stage pipeline (ECAPA-TDNN voice biometric match + Whisper/w2v-BERT transcript match), announces the score, and routes accordingly. This is the same pipeline used by the REST API `POST /api/v1/authenticate`.
 
@@ -286,6 +289,31 @@ To test the phone-based IVR flow:
 - **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.7.0 (2026-04-05)
+
+**New Features**
+- **5-service IVR catalog** — Replaces the single Health Insurance form with 5 selectable services: Inua Jamii Pension Withdrawal, M-Pesa Fund Transfer, Aid Verification, SIM Swap Protection, Telemedicine Check-In. Each has 3 questions + read-back template in English and Swahili (`twilio_integration/service_catalog.py`)
+- **Service menu endpoint** — New `/twilio/voice/service/menu` plays the 5 options and gathers DTMF 1-5; verifies `consent_token_id` up-front (`twilio_integration/webhook_handler.py`)
+- **Per-question correction flow** — When the caller says "No" at read-back, `/twilio/voice/service/correct` asks "which question — 1/2/3?". ASR + `parse_question_number` classify the response (supports "one/two/three", "moja/mbili/tatu", "first/second/third", digits). Only the named question is re-asked, then the read-back replays. Capped at 3 correction cycles.
+- **Unique enrollment phrases** — `pick_random_enrollment_phrase` now takes an `exclude` list so the 5 IVR prompts in one enrollment session are always distinct (`twilio_integration/ivr_flow.py`, `twilio_integration/webhook_handler.py`)
+
+**Schema/DB Changes**
+- `SERVICE_FORM` table refactored — dropped health-specific columns (`full_name`, `dependants`, `primary_facility`, `form_type`), added generic `service_code` + `answers_json` (TEXT, JSON keyed by each service's field_keys). Adding a new service is now a catalog edit, no migration (`app/models/service_form.py`, migration `f47b92c64a23`)
+
+### v1.6.0 (2026-04-04)
+
+**New Features**
+- **Real IVR consent flow** — `/twilio/voice/consent/callback` now runs full pipeline in background: downloads recording → transcribes → `classify_yes_no` → on "yes" Ed25519-signs + persists `CONSENT_TOKEN`, REST-API redirects to service menu; on "no" hangs up; on "unclear" retries once (`twilio_integration/webhook_handler.py`)
+- **Consent-gate on service flow** — `/voice/service*` endpoints verify consent token exists, is not revoked, and belongs to the citizen before any form question is asked
+- **Service form persistence** — New `SERVICE_FORM` table stores completed submissions with a reference ID derived from the form_id
+- **Yes/No intent classifier** — `classify_yes_no(transcript, lang)` helper with English + Swahili word lists (`app/services/confirmation_service.py`)
+
+### v1.5.0 (2026-04-04)
+
+**New Features**
+- **IVR background ML pipelines with REST API call updates** — Enrollment, auth, and service-answer ASR now run as background tasks while the caller hears hold audio. When the pipeline finishes, the Twilio REST API (`POST /Calls/{CallSid}.json`) instantly redirects the live call to the result — no polling, no webhook timeouts.
+- **IVR enrollment now writes to DB** — Downloads all 5 Twilio recordings, runs the full ECAPA-TDNN + Paillier HE pipeline, creates the `CITIZEN` record and `VOICE_TEMPLATE` (previously the IVR just said "complete" without persisting anything).
 
 ### v1.4.0 (2026-04-04)
 

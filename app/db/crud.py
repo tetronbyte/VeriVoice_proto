@@ -149,19 +149,15 @@ def create_service_form(
     citizen_id: str,
     consent_token_id: str,
     ministry_code: str,
-    form_type: str,
-    full_name: str,
-    dependants: int,
-    primary_facility: str,
+    service_code: str,
+    answers_json: str,
 ) -> ServiceForm:
     form = ServiceForm(
         citizen_id=citizen_id,
         consent_token_id=consent_token_id,
         ministry_code=ministry_code,
-        form_type=form_type,
-        full_name=full_name,
-        dependants=dependants,
-        primary_facility=primary_facility,
+        service_code=service_code,
+        answers_json=answers_json,
     )
     db.add(form)
     db.commit()

@@ -19,7 +19,7 @@ This guide covers how to set up, configure, and use the VeriVoice Interactive Vo
    - [Phase 2: Enrollment (First-time User)](#phase-2-enrollment-first-time-user)
    - [Phase 3: Authentication (Returning User)](#phase-3-authentication-returning-user)
    - [Phase 4: Consent](#phase-4-consent)
-   - [Phase 5: Service Access (Health Insurance Form)](#phase-5-service-access-health-insurance-form)
+   - [Phase 5: Service Access (5-service catalog)](#phase-5-service-access--5-service-catalog-same-call-after-consent)
 10. [Webhook Endpoint Reference](#10-webhook-endpoint-reference)
 11. [IVR State Machine](#11-ivr-state-machine)
 12. [Testing the IVR Locally](#12-testing-the-ivr-locally)
@@ -460,7 +460,7 @@ The system plays:
 **Decision:** Both factors must pass. The result (`granted` or `denied`) is logged in the `AUTH_EVENT` table. The voice score is announced to the caller.
 
 **If GRANTED:**
-> "Access granted. Your voice score is 0.87. Available services: Health Insurance Form. You will now be directed to consent."
+> "Access granted. Your voice score is 0.87. Available services: the services menu. You will now be directed to consent."
 
 The call **continues** (no hangup) — Amina is redirected to the consent flow.
 
@@ -501,99 +501,119 @@ Twilio POSTs to: `POST /twilio/voice/consent/callback?lang=en&citizen_id=<uuid>`
 4. No raw audio is stored — only the cryptographic proof of consent
 
 The system plays:
-> "Your consent has been recorded. You will now be directed to the Health Insurance Form."
+> "Your consent has been recorded. You will now be directed to the services menu."
 
 The call **continues** — Amina is redirected to the service access flow (no hangup).
 
 ---
 
-### Phase 5: Service Access — Health Insurance Form (same call, after consent)
+### Phase 5: Service Access — 5-service catalog (same call, after consent)
 
-After consent is recorded, the IVR stays in the same call and redirects Amina to the voice-driven health insurance form. The form asks **3 questions**, each designed to demonstrate a different ASR capability, followed by a **TTS read-back summary** for confirmation.
+After consent is recorded, the IVR redirects Amina into a **service menu**. She picks one of 5 services via DTMF, answers **3 questions** specific to that service, hears a **TTS read-back summary**, and confirms Yes/No. If she says No, the IVR asks which question to fix and only re-asks that single question before replaying the summary.
 
-**Step 1 — Question 1: Full Name (string capture)**
+The 5 services, defined in `twilio_integration/service_catalog.py`:
 
-Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=0`
+| DTMF | service_code | Service | Ministry |
+|:---:|---|---|---|
+| 1 | `pension` | Inua Jamii Pension Withdrawal | MLSP |
+| 2 | `mpesa_transfer` | M-Pesa Fund Transfer | SCL |
+| 3 | `aid_verification` | Aid Verification (Proof of Life) | UNHCR |
+| 4 | `sim_swap` | SIM Swap Protection | TELCO |
+| 5 | `telemedicine` | Telemedicine Check-In | MOH |
 
-> "Please say your full name."
+Each service has its own 3 questions and read-back template in both English and Swahili.
 
-*\[Beep\]* — Amina says: "Amina Juma Ochieng." She presses **#**. Twilio ends the recording and fires the callback.
+**Step 1 — Service menu (DTMF gather)**
 
-> **Why this question:** This is the strongest demo moment. Amina just authenticated via voiceprint, and now the system captures structured data from her speech. It shows Whisper ASR working on names — especially African names, which are non-trivial for speech recognition.
+Twilio POSTs to: `POST /twilio/voice/service/menu?lang=en&citizen_id=...&consent_token_id=...`
 
-**Step 2 — Callback, advance to question 2**
+Before the menu plays, the backend **verifies the `consent_token_id`** exists, is not revoked, and belongs to the citizen. If the consent token is missing or invalid, the call hangs up with "Consent is not valid. Goodbye."
 
-Twilio POSTs to: `POST /twilio/voice/service/callback?lang=en&question_index=0` with `RecordingUrl=https://api.twilio.com/...`
+> "Please select a service. Press 1 for Inua Jamii Pension Withdrawal. Press 2 for M-Pesa Fund Transfer. Press 3 for Aid Verification. Press 4 for SIM Swap Protection. Press 5 for Telemedicine Check-In."
 
-The backend downloads the recording, runs it through the preprocessing pipeline, and transcribes via Whisper. The answer `"Amina Juma Ochieng"` is stored. The IVR redirects to question 2.
+Amina presses **1**. Twilio POSTs the DTMF digit back to the same endpoint, which looks up the `service_code` and redirects to `/voice/service?service_code=pension&question_index=0`.
 
-**Step 3 — Question 2: Dependants (numeric capture)**
+**Step 2 — Service-specific questions (example: pension)**
 
-Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=1`
+Twilio POSTs to: `POST /voice/service?service_code=pension&question_index=0&...`
 
-> "How many dependants would you like to register?"
+The backend looks up the question set for `pension` and plays Q1:
 
-*\[Beep\]* — Amina says: "Three." She presses **#**. Recording ends.
+> "How many times have you received Inua Jamii payments before? Please say the number, or say first time."
 
-> **Why this question:** Shows the system handles different response types. When Whisper transcribes "three", the backend parses it to the number `3`. Works for both English ("three" -> 3) and Swahili ("tatu" -> 3). Proves the pipeline works beyond just capturing strings.
+*\[Beep\]* — Amina says: "Three." She presses **#**. Twilio fires `/voice/service/callback?question_index=0&service_code=pension`, which:
+1. Returns hold audio ("Processing your answer. Please hold.") keeping the call alive
+2. Starts a background task that downloads + transcribes the recording via Whisper/w2v-BERT
+3. When done, uses the Twilio REST API (`POST /Calls/{CallSid}.json`) to instantly redirect the live call to `/voice/service?service_code=pension&question_index=1&q0=three&...`
 
-**Step 4 — Callback, advance to question 3**
+This same pattern (hold audio + background ASR + REST API interrupt) is used for Q2 and Q3.
 
-The backend transcribes "three", parses it to `3`, and stores it. The IVR redirects to question 3.
+Q2 of pension:
 
-**Step 5 — Question 3: Primary Facility (proper noun / complex response)**
+> "Would you like to withdraw the full amount or a partial amount? Please say: full, or partial."
 
-Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=2`
+Q3 of pension:
 
-> "Which hospital or health centre would you like as your primary facility?"
+> "How would you like to receive your funds? Please say: M-Pesa wallet, or cash at agent."
 
-*\[Beep\]* — Amina says: "Kenyatta National Hospital." She presses **#**. Recording ends.
+The answers are accumulated across requests as URL-encoded query params `q0`, `q1`, `q2` (generic, not service-specific).
 
-> **Why this question:** This is the showstopper for the demo. It's a real-world question from actual health insurance enrollment (e.g., NHIF in Kenya). The answer is a proper noun (facility name), and it demonstrates Whisper handling longer, more complex spoken responses. When demoing in Swahili, this question is especially impressive.
+**Step 3 — TTS Read-back Summary**
 
-**Step 6 — Callback, all questions answered**
+After all 3 answers, Twilio hits `/voice/service?service_code=pension&question_index=3&...`. The backend calls `build_readback(service_code, lang, answers)` from the service catalog, which formats the answers into the service's read-back template:
 
-The backend transcribes the facility name and stores it. All 3 answers are now collected.
+> "You have requested a full Inua Jamii withdrawal, with three prior payments, delivered via M-Pesa wallet. Is this correct? Say yes or no."
 
-**Step 7 — TTS Read-back Summary**
+*\[Beep\]* — Amina says: "Yes." She presses **#**.
 
-Twilio POSTs to: `POST /twilio/voice/service?lang=en&question_index=3` (index exceeds question count, triggers summary)
+**Step 4a — Confirmation: YES (happy path)**
 
-The system generates a TTS read-back of all collected answers:
+Twilio POSTs to `/voice/service/confirm?service_code=pension&q0=...&q1=...&q2=...` with the recording. A background task runs ASR → `classify_yes_no(transcript, lang)`. On "yes", the backend:
 
-> "Thank you. I have recorded: your name is Amina Juma Ochieng, you have 3 dependants, and your preferred facility is Kenyatta National Hospital. Is this correct?"
+1. Persists a `SERVICE_FORM` row with `service_code="pension"`, `ministry_code="MLSP"`, `answers_json='{"payment_count":"three","withdrawal_type":"full","delivery_method":"M-Pesa wallet"}'`
+2. Uses the last 8 characters of the form_id (uppercase) as a short **reference ID**, e.g. `B928FDF5`
+3. Updates the live call via REST API with:
 
-*\[Beep\]* — Amina says: "Yes." She presses **#**. Recording ends.
+> "Request submitted successfully. Your reference ID is B928FDF5. Thank you for using VeriVoice."
 
-**Step 8 — Confirmation**
+The call ends.
 
-Twilio POSTs to: `POST /twilio/voice/service/confirm?lang=en&full_name=...&dependants=...&primary_facility=...` with `RecordingUrl=...`
+**Step 4b — Confirmation: NO (correction loop)**
 
-The backend would transcribe the confirmation and check for "yes" / "ndiyo". For the prototype, it assumes confirmed.
+If Amina says "No" at the read-back, the `/voice/service/confirm` background task redirects the call to `/voice/service/correct`:
 
-> "Your form is complete. Thank you for using VeriVoice."
+> "Which question would you like to change? Please say One, Two, or Three."
 
-The call ends (hangup).
+*\[Beep\]* — Amina says: "Two." She presses **#**.
 
-**What happens behind the scenes for each answer:**
+The `/voice/service/correct/callback` background task runs ASR → `parse_question_number(transcript, lang)` which recognises "one/two/three", "moja/mbili/tatu", "first/second/third", digits, etc. and returns an index 0/1/2.
 
-1. Twilio saves the recording and provides a `RecordingUrl`
-2. Backend downloads the audio via authenticated HTTP request
-3. `AudioPreprocessor` cleans the audio (16 kHz, VAD, noise reduction)
-4. `TranscriptionService` transcribes speech to text (Whisper for English, w2v-BERT for Swahili)
-5. For numeric answers (dependants): spoken words are parsed to digits ("three" -> 3, "tatu" -> 3)
-6. Answers are accumulated across steps via URL query parameters (stateless design)
-7. After all 3 answers, TTS generates a summary read-back for human confirmation
+On success, the call is redirected to `/voice/service?question_index=1&correcting_index=1&...`. Q2 is re-asked. After Amina gives a new answer, the background task sees `correcting_index == question_index` and jumps **straight back to the read-back** (`question_index=3`) rather than advancing to Q3 (which she already answered).
+
+The read-back plays again with the updated answer. Correction cycles are capped at 3; a third "no" ends the call with an apology.
+
+**Step 4c — Confirmation: unclear**
+
+If the caller's answer can't be classified (silence, noise, unexpected word), the IVR re-plays the prompt once. A second unclear answer ends the call.
 
 **The same flow in Swahili:**
 
-If Amina had selected Swahili (lang=sw), the questions would be:
-1. "Tafadhali sema jina lako kamili."
-2. "Ungependa kusajili wategemezi wangapi?"
-3. "Ungependa hospitali au kituo kipi cha afya kuwa kituo chako kikuu?"
+If Amina had selected Swahili (lang=sw), the pension menu item would be "Malipo ya Pensheni ya Inua Jamii", and the 3 questions would be:
 
-And the read-back:
-> "Asante. Nimekusanya: jina lako ni Amina Juma Ochieng, una wategemezi 3, na kituo chako kikuu ni Hospitali ya Kenyatta. Je, hii ni sahihi?"
+1. "Umepokea malipo ya Inua Jamii mara ngapi hapo awali? Tafadhali sema nambari, au sema mara ya kwanza."
+2. "Ungependa kutoa kiasi chote au kiasi cha sehemu? Tafadhali sema: chote, au sehemu."
+3. "Ungependa kupokeaje pesa zako? Tafadhali sema: mkoba wa M-Pesa, au pesa taslimu kwa wakala."
+
+Read-back: "Umeomba kutoa pensheni ya Inua Jamii ya chote, na malipo ya awali tatu, kupitia mkoba wa M-Pesa. Je, hii ni sahihi? Sema Ndiyo au Hapana."
+
+Yes/no classifier recognises "Ndiyo/Sawa/Kubali" for yes and "Hapana/La" for no. Question-number classifier recognises "Moja/Mbili/Tatu" and "Kwanza/Pili/Tatu".
+
+**Key architectural points:**
+
+- **Consent-gated**: every `/voice/service*` endpoint verifies `consent_token_id` before running.
+- **Stateless URL params**: no server-side call session; all state (answers, correction counter, service_code) travels in query params between requests.
+- **Generic schema**: `SERVICE_FORM.answers_json` is a JSON object keyed by each service's `field_keys` — adding a new service is purely a catalog edit, no DB migration.
+- **Background ASR + REST API**: keeps the caller on the line with hold audio while slow ML runs, then instantly redirects the call via Twilio's REST API when done.
 
 ---
 
@@ -609,15 +629,18 @@ All endpoints are mounted under the `/twilio` prefix and return TwiML XML.
 | `/twilio/voice/verify/start` | POST | DTMF identity verification — prompt for national ID | `lang` (query) |
 | `/twilio/voice/verify/nid` | POST | Trigger eSignet OTP for entered national ID, prompt for OTP | `Digits` (form), `lang` (query) |
 | `/twilio/voice/verify/otp` | POST | Verify OTP with eSignet, redirect to enrollment with national_id pre-filled | `Digits` (form), `lang` (query) |
-| `/twilio/voice/enroll` | POST | National ID input or play random phrase + record | `lang`, `step`, `national_id` (query) |
-| `/twilio/voice/enroll/callback` | POST | Handle completed enrollment recording | `RecordingUrl` (form), `lang`, `step`, `national_id` (query) |
+| `/twilio/voice/enroll` | POST | National ID input or play random **unique** phrase + record | `lang`, `step`, `national_id`, `session_id` (query) |
+| `/twilio/voice/enroll/callback` | POST | Handle completed enrollment recording; on final sample kicks off background ECAPA+Paillier pipeline | `RecordingUrl`, `CallSid` (form), `lang`, `step`, `national_id`, `session_id` (query) |
 | `/twilio/voice/authenticate` | POST | National ID input + challenge phrase + record | `lang`, `national_id`, `attempt` (query) |
-| `/twilio/voice/authenticate/callback` | POST | Download recording, run full auth pipeline, announce result, route to consent or retry | `RecordingUrl` (form), `lang`, `challenge_id`, `national_id`, `attempt` (query) |
-| `/twilio/voice/consent` | POST | Read consent text + record | `lang`, `citizen_id` (query) |
-| `/twilio/voice/consent/callback` | POST | Process consent recording, redirect to service access | `RecordingUrl` (form), `lang`, `citizen_id` (query) |
-| `/twilio/voice/service` | POST | Play form question or TTS read-back summary | `lang`, `question_index`, `citizen_id`, `full_name`, `dependants`, `primary_facility` (query) |
-| `/twilio/voice/service/callback` | POST | Process form answer, advance to next question | `RecordingUrl` (form), `lang`, `question_index`, `citizen_id`, `full_name`, `dependants`, `primary_facility` (query) |
-| `/twilio/voice/service/confirm` | POST | Handle yes/no confirmation after read-back | `RecordingUrl` (form), `lang`, `citizen_id`, `full_name`, `dependants`, `primary_facility` (query) |
+| `/twilio/voice/authenticate/callback` | POST | Kick off background auth pipeline (voice match + transcript); REST-API redirects call on result | `RecordingUrl`, `CallSid` (form), `lang`, `challenge_id`, `national_id`, `attempt` (query) |
+| `/twilio/voice/consent` | POST | Read consent text + record Yes/No | `lang`, `citizen_id`, `unclear_attempt` (query) |
+| `/twilio/voice/consent/callback` | POST | Background ASR → `classify_yes_no` → on "yes" Ed25519-sign+persist CONSENT_TOKEN, REST-API redirect to service menu | `RecordingUrl`, `CallSid` (form), `lang`, `citizen_id`, `unclear_attempt` (query) |
+| `/twilio/voice/service/menu` | POST | Play 5-service menu + gather DTMF 1–5; verifies `consent_token_id` up-front | `Digits` (form), `lang`, `citizen_id`, `consent_token_id` (query) |
+| `/twilio/voice/service` | POST | Play question for chosen `service_code` or TTS read-back summary | `lang`, `citizen_id`, `consent_token_id`, `service_code`, `question_index`, `q0`, `q1`, `q2`, `correction_attempts`, `unclear_attempt`, `correcting_index` (query) |
+| `/twilio/voice/service/callback` | POST | Kick off background ASR for one answer; on completion REST-API advances to next Q (or read-back if `correcting_index` matches) | `RecordingUrl`, `CallSid` (form) + same query params as above |
+| `/twilio/voice/service/confirm` | POST | Handle read-back Yes/No. On yes persists SERVICE_FORM (service_code + answers_json), announces 8-char reference ID, hangs up. On no redirects to correction. | `RecordingUrl`, `CallSid` (form) + service params |
+| `/twilio/voice/service/correct` | POST | Ask "which question — one, two, or three?" after caller says "no" at read-back | `lang`, `citizen_id`, `consent_token_id`, `service_code`, `q0/q1/q2`, `correction_attempts`, `unclear_attempt` (query) |
+| `/twilio/voice/service/correct/callback` | POST | Background ASR → `parse_question_number` → REST-API redirect to re-ask that single question with `correcting_index` set | `RecordingUrl`, `CallSid` (form) + same query params |
 
 ### Related REST API Endpoints (Non-IVR)
 
@@ -700,31 +723,47 @@ WELCOME
                                          CONSENT_PROMPT  <───────────────────────────────┘
                                               |  (same call, no hangup)
                                               |
-                                              +-- [Beep] Record consent --> presses #
+                                              +-- [Beep] Record "Yes/No" --> presses #
                                               |
                                               v
-                                         CONSENT_RECORDED
-                                              |  "Redirecting to Health Insurance Form"
+                                         CONSENT_PIPELINE (background)
+                                              |  ASR → classify_yes_no
+                                              |    yes  → Ed25519 sign + persist CONSENT_TOKEN
+                                              |    no   → hangup
+                                              |    unclear → retry once, then hangup
                                               |
                                               v
-                                         SERVICE_QUESTION (x3, same call)
+                                         SERVICE_MENU (DTMF 1-5)
+                                              |  1=pension, 2=mpesa_transfer, 3=aid_verification,
+                                              |  4=sim_swap, 5=telemedicine
                                               |
-                                              +-- Q1: "Full name?"
-                                              |   [Beep] --> speak --> presses #
+                                              +-- consent_token_id verified first
                                               |
-                                              +-- Q2: "How many dependants?"
-                                              |   [Beep] --> speak --> presses #
+                                              v
+                                         SERVICE_QUESTION (x3 for chosen service_code)
                                               |
-                                              +-- Q3: "Which facility?"
-                                                  [Beep] --> speak --> presses #
+                                              +-- Q1 → [Beep] → speak → # → background ASR → q0
+                                              +-- Q2 → [Beep] → speak → # → background ASR → q1
+                                              +-- Q3 → [Beep] → speak → # → background ASR → q2
                                                   |
                                                   v
-                                             TTS READ-BACK SUMMARY
-                                             "Your name is X, Y dependants, facility Z.
-                                              Is this correct?"
+                                             TTS READ-BACK SUMMARY (service-specific template)
                                                   |
-                                                  +-- [Beep] --> "Yes" --> presses #
+                                                  +-- [Beep] "Yes/No" --> presses #
                                                   |
+                                                  v
+                                             SERVICE_CONFIRM (background)
+                                                  |  ASR → classify_yes_no
+                                                  |    yes → persist SERVICE_FORM, announce ref ID, hangup
+                                                  |    no  → SERVICE_CORRECT
+                                                  |    unclear → retry once, then hangup
+                                                  |
+                                                  v
+                                             SERVICE_CORRECT — "Which question, 1/2/3?"
+                                                  |  ASR → parse_question_number
+                                                  |  re-ask that single Q only
+                                                  |  correcting_index → jumps back to READ-BACK
+                                                  |  cap: 3 correction cycles
                                                   v
                                              SERVICE_COMPLETE --> Hangup
 ```
@@ -771,14 +810,17 @@ curl -X POST "http://localhost:8000/twilio/voice/authenticate?lang=en"
 curl -X POST "http://localhost:8000/twilio/voice/authenticate?lang=en&attempt=0" \
   -d "Digits=29384756"
 
-# Test service access question 1
-curl -X POST "http://localhost:8000/twilio/voice/service?lang=en&question_index=0"
+# Test the service menu (expects Digits 1-5)
+curl -X POST "http://localhost:8000/twilio/voice/service/menu?lang=en&citizen_id=<uuid>&consent_token_id=<uuid>"
 
-# Test service access read-back summary (after all 3 answers)
-curl -X POST "http://localhost:8000/twilio/voice/service?lang=en&question_index=3&full_name=Amina&dependants=3&primary_facility=Kenyatta"
+# Test pension question 1 (needs valid consent_token_id)
+curl -X POST "http://localhost:8000/twilio/voice/service?lang=en&service_code=pension&question_index=0&citizen_id=<uuid>&consent_token_id=<uuid>"
+
+# Test pension read-back summary (question_index=3 triggers summary)
+curl -X POST "http://localhost:8000/twilio/voice/service?lang=en&service_code=pension&question_index=3&citizen_id=<uuid>&consent_token_id=<uuid>&q0=three&q1=full&q2=M-Pesa%20wallet"
 
 # Test the same in Swahili
-curl -X POST "http://localhost:8000/twilio/voice/service?lang=sw&question_index=0"
+curl -X POST "http://localhost:8000/twilio/voice/service?lang=sw&service_code=pension&question_index=0&citizen_id=<uuid>&consent_token_id=<uuid>"
 ```
 
 ### Option D: Twilio Console Debugger
@@ -1068,32 +1110,68 @@ Backend downloads recording, runs full auth pipeline:
   |
   v
 "Access granted. Your voice score is 0.87.           --> (same call continues)
- Available services: Health Insurance Form.
+ Available services menu.
  You will now be directed to consent."
   |
   v
-"I consent to share my health records..."            --> [Beep] "Yes" --> presses #
+"I consent to share my health records... Say Yes     --> [Beep] "Yes" --> presses #
+ to agree or No to decline."
   |
   v
-"Your consent has been recorded. You will now        --> (same call continues)
- be directed to the Health Insurance Form."
+Backend (background): ASR → classify_yes_no → "yes"
+  → Ed25519 sign + persist CONSENT_TOKEN
+  → REST API redirects call to service menu
   |
   v
-"Please say your full name."                         --> [Beep] "Amina Juma Ochieng" --> presses #
+"Please select a service. Press 1 for Inua Jamii      --> Presses 1
+ Pension Withdrawal. Press 2 for M-Pesa Fund
+ Transfer. Press 3 for Aid Verification.
+ Press 4 for SIM Swap Protection.
+ Press 5 for Telemedicine Check-In."
   |
   v
-"How many dependants would you like to register?"    --> [Beep] "Three" --> presses #
+"How many times have you received Inua Jamii         --> [Beep] "Three" --> presses #
+ payments before?"                                      (background ASR → q0="three")
   |
   v
-"Which hospital or health centre...?"                --> [Beep] "Kenyatta National Hospital" --> presses #
+"Would you like to withdraw the full amount or a     --> [Beep] "Full" --> presses #
+ partial amount?"                                       (background ASR → q1="full")
   |
   v
-"Thank you. I have recorded: your name is            --> [Beep] "Yes" --> presses #
- Amina Juma Ochieng, you have 3 dependants,
- and your preferred facility is Kenyatta
- National Hospital. Is this correct?"
+"How would you like to receive your funds?"          --> [Beep] "M-Pesa wallet" --> presses #
+                                                         (background ASR → q2="M-Pesa wallet")
   |
   v
-"Your form is complete. Thank you for                --> Hangup
- using VeriVoice."
+"You have requested a full Inua Jamii withdrawal,    --> [Beep] "Yes" --> presses #
+ with three prior payments, delivered via
+ M-Pesa wallet. Is this correct? Say yes or no."
+  |
+  v
+Backend (background): persist SERVICE_FORM, compute ref ID
+  |
+  v
+"Request submitted successfully. Your reference      --> Hangup
+ ID is B928FDF5. Thank you for using VeriVoice."
+```
+
+If Amina had said **"No"** at the read-back, she would have heard:
+
+```
+"Which question would you like to change?            --> [Beep] "Two" --> presses #
+ Please say One, Two, or Three."
+  |
+  v
+(only Q2 is re-asked)
+"Would you like to withdraw the full amount or a     --> [Beep] "Partial" --> presses #
+ partial amount?"                                       (background ASR → q1="partial")
+  |
+  v
+(read-back replays with the updated answer)
+"You have requested a partial Inua Jamii             --> [Beep] "Yes" --> presses #
+ withdrawal, with three prior payments,
+ delivered via M-Pesa wallet. Is this
+ correct? Say yes or no."
+  |
+  v
+"Request submitted successfully..."                  --> Hangup
 ```

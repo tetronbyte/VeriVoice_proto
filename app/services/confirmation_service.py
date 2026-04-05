@@ -23,6 +23,50 @@ _NEGATIVE: dict[str, set[str]] = {
 }
 
 
+_QUESTION_NUMBER_WORDS: dict[str, dict[str, int]] = {
+    "en": {
+        "one": 0, "1": 0, "first": 0, "number one": 0,
+        "two": 1, "2": 1, "second": 1, "number two": 1,
+        "three": 2, "3": 2, "third": 2, "number three": 2,
+    },
+    "sw": {
+        "moja": 0, "1": 0, "kwanza": 0, "ya kwanza": 0,
+        "mbili": 1, "2": 1, "pili": 1, "ya pili": 1,
+        "tatu": 2, "3": 2, "tatu": 2, "ya tatu": 2,
+    },
+}
+
+
+def parse_question_number(transcript: str, lang: str = "en") -> int | None:
+    """Classify a transcript as a question index 0/1/2 (for "one/two/three").
+
+    Recognizes digits ("1", "2", "3"), English ordinals ("first", "second",
+    "third"), and Swahili equivalents ("moja", "mbili", "tatu", "kwanza"
+    etc.). Returns None if nothing parseable is found.
+    """
+    if not transcript or not transcript.strip():
+        return None
+
+    norm = _normalize(transcript)
+    tokens = norm.split()
+    if not tokens:
+        return None
+
+    words = _QUESTION_NUMBER_WORDS.get(lang, _QUESTION_NUMBER_WORDS["en"])
+
+    # Check each individual token first (most common case: "two" or "2")
+    for tok in tokens:
+        if tok in words:
+            return words[tok]
+
+    # Check multi-word phrases ("number one", "ya kwanza")
+    for phrase, idx in words.items():
+        if " " in phrase and phrase in norm:
+            return idx
+
+    return None
+
+
 def classify_yes_no(transcript: str, lang: str = "en") -> str:
     """Classify a transcript as "yes", "no", or "unclear".
 
