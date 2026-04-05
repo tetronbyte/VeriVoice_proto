@@ -520,7 +520,7 @@ async def authenticate_prompt(
                 action=f"/twilio/voice/authenticate?lang={lang}&attempt={attempt}",
                 method="POST",
                 finish_on_key="#",
-                timeout=10,
+                timeout=30,
             )
             _say_or_play(
                 gather,
@@ -530,7 +530,38 @@ async def authenticate_prompt(
                 lang,
             )
             response.append(gather)
+            # No input after timeout — retry once
+            _say_or_play(
+                response,
+                "Hukuingiza nambari yoyote." if lang == "sw" else "No number entered.",
+                lang,
+            )
+            response.redirect(
+                f"/twilio/voice/authenticate?lang={lang}&attempt={attempt}",
+                method="POST",
+            )
             return _twiml_response(response)
+
+    # Step 1.5: Look up citizen. If not enrolled, send them to the enrollment flow.
+    db = SessionLocal()
+    try:
+        citizen = get_citizen_by_national_id(db, national_id)
+    finally:
+        db.close()
+    if citizen is None:
+        print(f"[IVR AUTH] Citizen not found for national_id={national_id} — redirecting to enroll", flush=True)
+        _say_or_play(
+            response,
+            "Nambari hiyo haijasajiliwa. Tafadhali sajili kwanza."
+            if lang == "sw"
+            else "That national ID is not enrolled. Please enroll first.",
+            lang,
+        )
+        response.redirect(
+            f"/twilio/voice/enroll?lang={lang}&step=0&national_id={national_id}",
+            method="POST",
+        )
+        return _twiml_response(response)
 
     # Step 2: Generate challenge phrase and prompt user to speak it
     challenge = _challenge_service.generate_challenge(language=lang)
@@ -994,7 +1025,7 @@ async def consent_callback(
         lang,
     )
     wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(15):  # ~60s fallback
+    for _ in range(40):  # ~3 min hold until background pipeline interrupts
         response.pause(length=3)
         _say_or_play(response, wait_msg, lang)
     response.hangup()
@@ -1235,7 +1266,7 @@ async def service_callback(
         lang,
     )
     wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(15):
+    for _ in range(40):  # ~3 min hold until background pipeline interrupts
         response.pause(length=3)
         _say_or_play(response, wait_msg, lang)
     response.hangup()
@@ -1456,7 +1487,7 @@ async def service_confirm(
         lang,
     )
     wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(15):
+    for _ in range(40):  # ~3 min hold until background pipeline interrupts
         response.pause(length=3)
         _say_or_play(response, wait_msg, lang)
     response.hangup()
