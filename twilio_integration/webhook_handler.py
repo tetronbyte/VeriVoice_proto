@@ -26,17 +26,25 @@ from sqlalchemy.orm import Session
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import Gather, VoiceResponse
 
+from datetime import datetime, timezone
+
 from app.config import settings
 from app.db.crud import (
     create_auth_event,
     create_citizen,
+    create_consent_token,
+    create_service_form,
     create_voice_template,
     get_active_template,
+    get_citizen_by_id,
     get_citizen_by_national_id,
+    get_consent_token,
 )
 from app.db.database import get_db, SessionLocal
 from app.services.audio_preprocessor import AudioPreprocessor
 from app.services.challenge_service import ChallengeService
+from app.services.confirmation_service import classify_yes_no
+from app.services.consent_service import ConsentService
 from app.services.embedding_service import EmbeddingService
 from app.services.encryption_service import EncryptionService
 from app.services.matching_service import MatchingService
@@ -53,6 +61,7 @@ _encryption_service = EncryptionService()
 _matching_service = MatchingService()
 _challenge_service = ChallengeService()
 _tts_service = TTSService()
+_consent_service = ConsentService()
 _redis_client = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
 # In-memory store for enrollment recording URLs (keyed by session_id)
@@ -62,12 +71,19 @@ _enroll_recordings: dict[str, list[str]] = {}
 # ── Twilio call update helper ────────────────────────────────────────────────
 
 async def _update_call_twiml(call_sid: str, twiml: str) -> None:
-    """Redirect an in-progress Twilio call to new TwiML via the REST API."""
+    """Redirect an in-progress Twilio call to new TwiML via the REST API.
+
+    Gracefully handles the case where the call has already ended (404/status
+    completed) by logging and returning — callers catch their own exceptions.
+    """
     url = (f"https://api.twilio.com/2010-04-01/Accounts/"
            f"{settings.TWILIO_ACCOUNT_SID}/Calls/{call_sid}.json")
     auth = (settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
     async with httpx.AsyncClient(auth=auth) as client:
         resp = await client.post(url, data={"Twiml": twiml}, timeout=10.0)
+        if resp.status_code == 404:
+            print(f"[TWILIO] Call {call_sid} already ended (404) — skipping update", flush=True)
+            return
         resp.raise_for_status()
     print(f"[TWILIO] Updated call {call_sid} with new TwiML", flush=True)
 
@@ -154,9 +170,9 @@ async def welcome_language(
     response = VoiceResponse()
 
     if lang == "sw":
-        msg = "Umechagua Kiswahili. Bonyeza 1 kusajili. Bonyeza 2 kuthibitisha."
+        msg = "Umechagua Kiswahili. Bonyeza 1 kusajili. Bonyeza 2 kuthibitisha. Bonyeza 3 kuthibitisha kitambulisho."
     else:
-        msg = "You selected English. Press 1 to enroll. Press 2 to authenticate."
+        msg = "You selected English. Press 1 to enroll. Press 2 to authenticate. Press 3 to verify your identity."
 
     print(f"[IVR LANGUAGE] >>> Playing: '{msg}'", flush=True)
     gather = Gather(
@@ -181,6 +197,7 @@ async def welcome_action(
     action = {
         "1": "ENROLL",
         "2": "AUTHENTICATE",
+        "3": "VERIFY_IDENTITY",
     }.get(Digits, "INVALID")
     print(f"[IVR ACTION] <<< User pressed: {Digits} → Routing to {action} (lang={lang})", flush=True)
     response = VoiceResponse()
@@ -190,6 +207,9 @@ async def welcome_action(
     elif Digits == "2":
         print("[IVR ACTION] >>> Redirecting to AUTHENTICATION flow", flush=True)
         response.redirect(f"/twilio/voice/authenticate?lang={lang}", method="POST")
+    elif Digits == "3":
+        print("[IVR ACTION] >>> Redirecting to VERIFY IDENTITY flow", flush=True)
+        response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
     else:
         print(f"[IVR ACTION] >>> Invalid selection '{Digits}', restarting welcome", flush=True)
         response.say("Invalid selection.", voice="alice")
@@ -733,23 +753,51 @@ async def authenticate_callback(
 # CONSENT
 # ═════════════════════════════════════════════════════════════════════════════
 
+_CONSENT_MINISTRY_CODE = "MOH"
+_CONSENT_DATA_SCOPE = "health_records"
+
+
 @router.post("/voice/consent")
 async def consent_prompt(
     request: Request,
     lang: str = Query(default="en"),
     citizen_id: str = Query(default=""),
+    unclear_attempt: int = Query(default=0),
 ):
-    """Read consent text and record the user's verbal affirmation."""
+    """Read consent text and record the user's verbal Yes/No response.
+
+    Validates the citizen exists before prompting. If previous attempt was
+    unclear, re-prompts with a clarification message.
+    """
     await _validate_twilio_request(request)
     response = VoiceResponse()
 
-    if lang == "sw":
-        consent_text = "Ninakubali kushiriki rekodi zangu za afya na Wizara ya Afya. Sema Ndiyo kukubali."
-    else:
-        consent_text = "I consent to share my health records with the Ministry of Health. Say Yes to agree."
+    # Session validation: bail out if citizen_id is bogus
+    db = SessionLocal()
+    try:
+        citizen = get_citizen_by_id(db, citizen_id) if citizen_id else None
+    finally:
+        db.close()
+    if citizen is None:
+        print(f"[IVR CONSENT] ERROR: Invalid citizen_id={citizen_id}", flush=True)
+        _say_or_play(response,
+                     "Kikao hakipatikani. Kwaheri." if lang == "sw"
+                     else "Session not found. Goodbye.", lang)
+        response.hangup()
+        return _twiml_response(response)
 
-    print(f"[IVR CONSENT] >>> Playing: '{consent_text}' (lang={lang}, citizen_id={citizen_id})", flush=True)
-    print(f"[IVR CONSENT] Waiting for user to say 'Yes'/'Ndiyo' and record...", flush=True)
+    if unclear_attempt > 0:
+        clarify = ("Sikusikia vizuri. Tafadhali sema Ndiyo au Hapana."
+                   if lang == "sw"
+                   else "I didn't catch that. Please say Yes or No.")
+        _say_or_play(response, clarify, lang)
+
+    if lang == "sw":
+        consent_text = "Ninakubali kushiriki rekodi zangu za afya na Wizara ya Afya. Sema Ndiyo kukubali au Hapana kukataa."
+    else:
+        consent_text = "I consent to share my health records with the Ministry of Health. Say Yes to agree or No to decline."
+
+    print(f"[IVR CONSENT] >>> Playing: '{consent_text}' (lang={lang}, citizen_id={citizen_id}, attempt={unclear_attempt})", flush=True)
     _say_or_play(response, consent_text, lang)
     _say_or_play(
         response,
@@ -758,7 +806,8 @@ async def consent_prompt(
     )
     response.record(
         max_length=10,
-        action=f"/twilio/voice/consent/callback?lang={lang}&citizen_id={citizen_id}",
+        action=(f"/twilio/voice/consent/callback?lang={lang}"
+                f"&citizen_id={citizen_id}&unclear_attempt={unclear_attempt}"),
         method="POST",
         play_beep=True,
         trim="trim-silence",
@@ -768,29 +817,165 @@ async def consent_prompt(
     return _twiml_response(response)
 
 
+async def _run_consent_pipeline(
+    recording_url: str, citizen_id: str, lang: str,
+    unclear_attempt: int, call_sid: str,
+):
+    """Background task: transcribe consent, classify yes/no, sign+persist token.
+
+    Updates the live Twilio call via REST API with the result:
+      - yes     -> sign Ed25519 token, persist, redirect to /voice/service
+      - no      -> "Consent declined" and hangup
+      - unclear -> retry once, then hangup after 2 unclear attempts
+    """
+    base = settings.PUBLIC_BASE_URL.rstrip("/")
+
+    def _build_twiml_with(fn) -> str:
+        r = VoiceResponse()
+        fn(r)
+        return str(r)
+
+    try:
+        print(f"[CONSENT BG] Downloading recording...", flush=True)
+        audio_bytes = await _download_twilio_recording(recording_url)
+        print(f"[CONSENT BG] Downloaded: {len(audio_bytes)} bytes", flush=True)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        preprocessed = _preprocessor.process(tmp_path)
+        os.unlink(tmp_path)
+
+        transcription_service = TranscriptionService()
+        transcript = transcription_service.transcribe(preprocessed, language=lang).strip()
+        print(f"[CONSENT BG] Transcript: '{transcript}'", flush=True)
+
+        intent = classify_yes_no(transcript, lang)
+        print(f"[CONSENT BG] Intent: {intent}", flush=True)
+
+        if intent == "yes":
+            # Sign + persist consent token
+            db = SessionLocal()
+            try:
+                issued_at = datetime.now(timezone.utc)
+                signature = _consent_service.sign_consent(
+                    citizen_id=citizen_id,
+                    ministry_code=_CONSENT_MINISTRY_CODE,
+                    data_scope=_CONSENT_DATA_SCOPE,
+                    issued_at=issued_at.isoformat(),
+                )
+                token = create_consent_token(
+                    db,
+                    citizen_id=citizen_id,
+                    ministry_code=_CONSENT_MINISTRY_CODE,
+                    data_scope=_CONSENT_DATA_SCOPE,
+                    digital_signature=signature,
+                )
+                print(f"[CONSENT BG] Signed+persisted token_id={token.token_id}", flush=True)
+                token_id = str(token.token_id)
+            finally:
+                db.close()
+
+            def _granted(r: VoiceResponse):
+                _say_or_play(r,
+                    "Idhini imerekodiwa. Utaelekezwa kwenye fomu."
+                    if lang == "sw"
+                    else "Consent recorded. You will now be directed to the form.",
+                    lang)
+                r.redirect(
+                    f"{base}/twilio/voice/service?lang={lang}&question_index=0"
+                    f"&citizen_id={citizen_id}&consent_token_id={token_id}",
+                    method="POST",
+                )
+            await _update_call_twiml(call_sid, _build_twiml_with(_granted))
+            return
+
+        if intent == "no":
+            def _denied(r: VoiceResponse):
+                _say_or_play(r,
+                    "Idhini imekataliwa. Kwaheri."
+                    if lang == "sw"
+                    else "Consent declined. Goodbye.",
+                    lang)
+                r.hangup()
+            await _update_call_twiml(call_sid, _build_twiml_with(_denied))
+            return
+
+        # unclear
+        if unclear_attempt < 1:
+            def _retry(r: VoiceResponse):
+                r.redirect(
+                    f"{base}/twilio/voice/consent?lang={lang}"
+                    f"&citizen_id={citizen_id}&unclear_attempt=1",
+                    method="POST",
+                )
+            await _update_call_twiml(call_sid, _build_twiml_with(_retry))
+            return
+
+        def _give_up(r: VoiceResponse):
+            _say_or_play(r,
+                "Sikuweza kuelewa. Tafadhali jaribu tena baadaye. Kwaheri."
+                if lang == "sw"
+                else "I could not understand. Please try again later. Goodbye.",
+                lang)
+            r.hangup()
+        await _update_call_twiml(call_sid, _build_twiml_with(_give_up))
+
+    except Exception as e:
+        print(f"[CONSENT BG] ERROR: {e}", flush=True)
+        try:
+            def _err(r: VoiceResponse):
+                _say_or_play(r,
+                    "Hitilafu imetokea. Tafadhali jaribu tena baadaye."
+                    if lang == "sw"
+                    else "An error occurred. Please try again later.",
+                    lang)
+                r.hangup()
+            await _update_call_twiml(call_sid, _build_twiml_with(_err))
+        except Exception as e2:
+            print(f"[CONSENT BG] Unable to update call (already ended?): {e2}", flush=True)
+
+
 @router.post("/voice/consent/callback")
 async def consent_callback(
     request: Request,
     lang: str = Query(default="en"),
     citizen_id: str = Query(default=""),
+    unclear_attempt: int = Query(default=0),
     RecordingUrl: str = Form(default=""),
+    CallSid: str = Form(default=""),
 ):
-    """Process consent recording, then redirect to service access (health insurance form)."""
+    """Kick off consent pipeline in background, play hold audio until done."""
     await _validate_twilio_request(request)
     print(f"[IVR CONSENT CALLBACK] <<< Recording received: {RecordingUrl[:80] if RecordingUrl else '(none)'} (lang={lang}, citizen_id={citizen_id})", flush=True)
     response = VoiceResponse()
-    print("[IVR CONSENT CALLBACK] >>> Consent recorded — redirecting to Health Insurance Form", flush=True)
+
+    if not RecordingUrl:
+        # No recording — treat as unclear, retry
+        response.redirect(
+            f"/twilio/voice/consent?lang={lang}&citizen_id={citizen_id}"
+            f"&unclear_attempt={unclear_attempt}",
+            method="POST",
+        )
+        return _twiml_response(response)
+
+    asyncio.create_task(_run_consent_pipeline(
+        RecordingUrl, citizen_id, lang, unclear_attempt, CallSid
+    ))
+
+    # Hold audio until background task interrupts via REST API
     _say_or_play(
         response,
-        "Idhini yako imerekodiwa. Sasa utaelekezwa kwenye fomu ya bima ya afya."
+        "Idhini yako inachakatwa. Tafadhali subiri."
         if lang == "sw"
-        else "Your consent has been recorded. You will now be directed to the Health Insurance Form.",
+        else "Processing your consent. Please hold.",
         lang,
     )
-    response.redirect(
-        f"/twilio/voice/service?lang={lang}&question_index=0&citizen_id={citizen_id}",
-        method="POST",
-    )
+    wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
+    for _ in range(15):  # ~60s fallback
+        response.pause(length=3)
+        _say_or_play(response, wait_msg, lang)
+    response.hangup()
     return _twiml_response(response)
 
 
@@ -820,39 +1005,69 @@ async def service_prompt(
     lang: str = Query(default="en"),
     question_index: int = Query(default=0),
     citizen_id: str = Query(default=""),
+    consent_token_id: str = Query(default=""),
     full_name: str = Query(default=""),
     dependants: str = Query(default=""),
     primary_facility: str = Query(default=""),
+    correction_attempts: int = Query(default=0),
+    unclear_attempt: int = Query(default=0),
 ):
-    """Play a health insurance form question and record the answer."""
+    """Play a health insurance form question and record the answer.
+
+    Requires a valid consent_token_id (gates the entire service flow).
+    """
     await _validate_twilio_request(request)
     response = VoiceResponse()
+
+    # Gate: verify consent token is valid before serving any form questions
+    db = SessionLocal()
+    try:
+        if not consent_token_id:
+            print("[IVR SERVICE] ERROR: no consent_token_id in URL", flush=True)
+            _say_or_play(response,
+                "Hakuna idhini halali. Kwaheri." if lang == "sw"
+                else "No valid consent on file. Goodbye.", lang)
+            response.hangup()
+            return _twiml_response(response)
+        token = get_consent_token(db, consent_token_id)
+        if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id):
+            print(f"[IVR SERVICE] ERROR: invalid/revoked consent token {consent_token_id}", flush=True)
+            _say_or_play(response,
+                "Idhini si halali. Kwaheri." if lang == "sw"
+                else "Consent is not valid. Goodbye.", lang)
+            response.hangup()
+            return _twiml_response(response)
+    finally:
+        db.close()
 
     q_list = _SERVICE_QUESTIONS.get(lang, _SERVICE_QUESTIONS["en"])
 
     if question_index >= len(q_list):
-        # All 3 questions answered — play TTS read-back summary
-        print(f"[IVR SERVICE SUMMARY] All 3 questions answered. Collected: name='{full_name}', dependants='{dependants}', facility='{primary_facility}'", flush=True)
+        # All 3 questions answered — play TTS read-back summary, record yes/no
+        print(f"[IVR SERVICE SUMMARY] All 3 questions answered. name='{full_name}', dependants='{dependants}', facility='{primary_facility}' (correction={correction_attempts}, unclear={unclear_attempt})", flush=True)
+        if unclear_attempt > 0:
+            clarify = ("Sikusikia vizuri. Tafadhali sema Ndiyo au Hapana."
+                       if lang == "sw"
+                       else "I didn't catch that. Please say Yes or No.")
+            _say_or_play(response, clarify, lang)
+
         if lang == "sw":
             summary = (
                 f"Asante. Nimekusanya: jina lako ni {full_name}, "
                 f"una wategemezi {dependants}, "
                 f"na kituo chako kikuu ni {primary_facility}. "
-                f"Je, hii ni sahihi?"
+                f"Je, hii ni sahihi? Sema Ndiyo au Hapana."
             )
         else:
             summary = (
                 f"Thank you. I have recorded: your name is {full_name}, "
                 f"you have {dependants} dependants, "
                 f"and your preferred facility is {primary_facility}. "
-                f"Is this correct?"
+                f"Is this correct? Say Yes or No."
             )
 
         print(f"[IVR SERVICE SUMMARY] >>> Playing read-back: '{summary}'", flush=True)
-        print(f"[IVR SERVICE SUMMARY] Waiting for user to confirm (yes/no)...", flush=True)
         _say_or_play(response, summary, lang)
-
-        # Record confirmation (yes/no)
         _say_or_play(
             response,
             "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
@@ -863,8 +1078,11 @@ async def service_prompt(
             max_length=5,
             action=(
                 f"/twilio/voice/service/confirm?lang={lang}&citizen_id={citizen_id}"
+                f"&consent_token_id={consent_token_id}"
                 f"&full_name={quote(full_name)}&dependants={quote(dependants)}"
                 f"&primary_facility={quote(primary_facility)}"
+                f"&correction_attempts={correction_attempts}"
+                f"&unclear_attempt={unclear_attempt}"
             ),
             method="POST",
             play_beep=True,
@@ -888,8 +1106,10 @@ async def service_prompt(
         action=(
             f"/twilio/voice/service/callback?lang={lang}"
             f"&question_index={question_index}&citizen_id={citizen_id}"
+            f"&consent_token_id={consent_token_id}"
             f"&full_name={quote(full_name)}&dependants={quote(dependants)}"
             f"&primary_facility={quote(primary_facility)}"
+            f"&correction_attempts={correction_attempts}"
         ),
         method="POST",
         play_beep=True,
@@ -901,8 +1121,9 @@ async def service_prompt(
 
 
 async def _run_service_transcription(
-    recording_url: str, question_index: int, citizen_id: str, lang: str,
-    full_name: str, dependants: str, primary_facility: str, call_sid: str,
+    recording_url: str, question_index: int, citizen_id: str, consent_token_id: str,
+    lang: str, full_name: str, dependants: str, primary_facility: str,
+    correction_attempts: int, call_sid: str,
 ):
     """Background task: transcribe service answer and redirect call to next question."""
     from urllib.parse import quote
@@ -925,7 +1146,6 @@ async def _run_service_transcription(
         print(f"[SERVICE BG Q{question_index+1}] ERROR: {e}", flush=True)
         answer = "(unclear)"
 
-    # Update the field with the transcribed answer
     if question_index == 0:
         full_name = answer
     elif question_index == 1:
@@ -933,20 +1153,21 @@ async def _run_service_transcription(
     elif question_index == 2:
         primary_facility = answer
 
-    # Build redirect TwiML and update the live call
     base = settings.PUBLIC_BASE_URL.rstrip("/")
     next_q = question_index + 1
     r = VoiceResponse()
     r.redirect(
         f"{base}/twilio/voice/service?lang={lang}&question_index={next_q}&citizen_id={citizen_id}"
+        f"&consent_token_id={consent_token_id}"
         f"&full_name={quote(full_name)}&dependants={quote(dependants)}"
-        f"&primary_facility={quote(primary_facility)}",
+        f"&primary_facility={quote(primary_facility)}"
+        f"&correction_attempts={correction_attempts}",
         method="POST",
     )
     try:
         await _update_call_twiml(call_sid, str(r))
     except Exception as e:
-        print(f"[SERVICE BG Q{question_index+1}] ERROR updating call: {e}", flush=True)
+        print(f"[SERVICE BG Q{question_index+1}] Unable to update call (already ended?): {e}", flush=True)
 
 
 @router.post("/voice/service/callback")
@@ -955,9 +1176,11 @@ async def service_callback(
     lang: str = Query(default="en"),
     question_index: int = Query(default=0),
     citizen_id: str = Query(default=""),
+    consent_token_id: str = Query(default=""),
     full_name: str = Query(default=""),
     dependants: str = Query(default=""),
     primary_facility: str = Query(default=""),
+    correction_attempts: int = Query(default=0),
     RecordingUrl: str = Form(default=""),
     CallSid: str = Form(default=""),
 ):
@@ -967,35 +1190,200 @@ async def service_callback(
     response = VoiceResponse()
 
     if not RecordingUrl:
-        # Nothing to transcribe — just advance with empty answer
         from urllib.parse import quote
         next_q = question_index + 1
         response.redirect(
             f"/twilio/voice/service?lang={lang}&question_index={next_q}&citizen_id={citizen_id}"
+            f"&consent_token_id={consent_token_id}"
             f"&full_name={quote(full_name)}&dependants={quote(dependants)}"
-            f"&primary_facility={quote(primary_facility)}",
+            f"&primary_facility={quote(primary_facility)}"
+            f"&correction_attempts={correction_attempts}",
             method="POST",
         )
         return _twiml_response(response)
 
-    # Start transcription in background; it will redirect the call via REST API
     asyncio.create_task(_run_service_transcription(
-        RecordingUrl, question_index, citizen_id, lang,
-        full_name, dependants, primary_facility, CallSid,
+        RecordingUrl, question_index, citizen_id, consent_token_id, lang,
+        full_name, dependants, primary_facility, correction_attempts, CallSid,
     ))
 
-    # Play hold audio until background task interrupts via REST API
     _say_or_play(
         response,
         "Jibu lako linachakatwa." if lang == "sw" else "Processing your answer.",
         lang,
     )
     wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(15):  # ~60s fallback
+    for _ in range(15):
         response.pause(length=3)
         _say_or_play(response, wait_msg, lang)
     response.hangup()
     return _twiml_response(response)
+
+
+def _parse_dependants_int(raw: str) -> int:
+    """Best-effort parse of the spoken dependants answer to an int.
+
+    Handles numeric digits in the transcript, plus English number-words zero..ten.
+    Falls back to 0 if nothing parseable is found.
+    """
+    import re
+    if not raw:
+        return 0
+    # Try digits first
+    m = re.search(r"\d+", raw)
+    if m:
+        try:
+            return int(m.group())
+        except ValueError:
+            pass
+    # Fall back to number words (English + a couple of Swahili)
+    words = {
+        "zero": 0, "none": 0, "no": 0,
+        "one": 1, "moja": 1,
+        "two": 2, "mbili": 2,
+        "three": 3, "tatu": 3,
+        "four": 4, "nne": 4,
+        "five": 5, "tano": 5,
+        "six": 6, "sita": 6,
+        "seven": 7, "saba": 7,
+        "eight": 8, "nane": 8,
+        "nine": 9, "tisa": 9,
+        "ten": 10, "kumi": 10,
+    }
+    for tok in raw.lower().split():
+        tok = "".join(c for c in tok if c.isalpha())
+        if tok in words:
+            return words[tok]
+    return 0
+
+
+async def _run_service_confirm_pipeline(
+    recording_url: str, citizen_id: str, consent_token_id: str, lang: str,
+    full_name: str, dependants: str, primary_facility: str,
+    correction_attempts: int, unclear_attempt: int, call_sid: str,
+):
+    """Background task: classify yes/no on read-back, persist or restart form."""
+    from urllib.parse import quote
+    base = settings.PUBLIC_BASE_URL.rstrip("/")
+
+    def _build(fn) -> str:
+        r = VoiceResponse()
+        fn(r)
+        return str(r)
+
+    try:
+        print(f"[SERVICE CONFIRM BG] Downloading recording...", flush=True)
+        audio_bytes = await _download_twilio_recording(recording_url)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        preprocessed = _preprocessor.process(tmp_path)
+        os.unlink(tmp_path)
+
+        transcription_service = TranscriptionService()
+        transcript = transcription_service.transcribe(preprocessed, language=lang).strip()
+        print(f"[SERVICE CONFIRM BG] Transcript: '{transcript}'", flush=True)
+        intent = classify_yes_no(transcript, lang)
+        print(f"[SERVICE CONFIRM BG] Intent: {intent}", flush=True)
+
+        if intent == "yes":
+            # Persist the form
+            db = SessionLocal()
+            try:
+                deps_int = _parse_dependants_int(dependants)
+                form = create_service_form(
+                    db,
+                    citizen_id=citizen_id,
+                    consent_token_id=consent_token_id,
+                    ministry_code=_CONSENT_MINISTRY_CODE,
+                    form_type="health_insurance",
+                    full_name=full_name,
+                    dependants=deps_int,
+                    primary_facility=primary_facility,
+                )
+                ref_id = str(form.form_id)[-8:].upper()
+                print(f"[SERVICE CONFIRM BG] Persisted form_id={form.form_id} ref={ref_id}", flush=True)
+            finally:
+                db.close()
+
+            def _done(r: VoiceResponse):
+                if lang == "sw":
+                    msg = (f"Fomu imewasilishwa. Nambari yako ya rejeleo ni {ref_id}. "
+                           f"Asante kwa kutumia VeriVoice.")
+                else:
+                    msg = (f"Form submitted successfully. Your reference ID is {ref_id}. "
+                           f"Thank you for using VeriVoice.")
+                _say_or_play(r, msg, lang)
+                r.hangup()
+            await _update_call_twiml(call_sid, _build(_done))
+            return
+
+        if intent == "no":
+            # Restart the form (bump correction counter, cap at 2)
+            if correction_attempts >= 2:
+                def _give_up(r: VoiceResponse):
+                    _say_or_play(r,
+                        "Imeshindikana kukamilisha fomu. Tafadhali jaribu tena baadaye. Kwaheri."
+                        if lang == "sw"
+                        else "Unable to complete the form at this time. Please try again later. Goodbye.",
+                        lang)
+                    r.hangup()
+                await _update_call_twiml(call_sid, _build(_give_up))
+                return
+
+            new_attempts = correction_attempts + 1
+            def _restart(r: VoiceResponse):
+                _say_or_play(r,
+                    "Sawa, hebu tuanze upya fomu."
+                    if lang == "sw"
+                    else "Okay, let us restart the form.",
+                    lang)
+                r.redirect(
+                    f"{base}/twilio/voice/service?lang={lang}&question_index=0"
+                    f"&citizen_id={citizen_id}&consent_token_id={consent_token_id}"
+                    f"&correction_attempts={new_attempts}",
+                    method="POST",
+                )
+            await _update_call_twiml(call_sid, _build(_restart))
+            return
+
+        # unclear
+        if unclear_attempt < 1:
+            def _retry(r: VoiceResponse):
+                # Jump back to the summary step (question_index == len(questions))
+                r.redirect(
+                    f"{base}/twilio/voice/service?lang={lang}&question_index=3"
+                    f"&citizen_id={citizen_id}&consent_token_id={consent_token_id}"
+                    f"&full_name={quote(full_name)}&dependants={quote(dependants)}"
+                    f"&primary_facility={quote(primary_facility)}"
+                    f"&correction_attempts={correction_attempts}&unclear_attempt=1",
+                    method="POST",
+                )
+            await _update_call_twiml(call_sid, _build(_retry))
+            return
+
+        def _give_up(r: VoiceResponse):
+            _say_or_play(r,
+                "Sikuweza kuthibitisha. Tafadhali jaribu tena baadaye. Kwaheri."
+                if lang == "sw"
+                else "Unable to confirm. Please try again later. Goodbye.",
+                lang)
+            r.hangup()
+        await _update_call_twiml(call_sid, _build(_give_up))
+
+    except Exception as e:
+        print(f"[SERVICE CONFIRM BG] ERROR: {e}", flush=True)
+        try:
+            def _err(r: VoiceResponse):
+                _say_or_play(r,
+                    "Hitilafu imetokea. Tafadhali jaribu tena baadaye."
+                    if lang == "sw"
+                    else "An error occurred. Please try again later.",
+                    lang)
+                r.hangup()
+            await _update_call_twiml(call_sid, _build(_err))
+        except Exception as e2:
+            print(f"[SERVICE CONFIRM BG] Unable to update call (already ended?): {e2}", flush=True)
 
 
 @router.post("/voice/service/confirm")
@@ -1003,26 +1391,174 @@ async def service_confirm(
     request: Request,
     lang: str = Query(default="en"),
     citizen_id: str = Query(default=""),
+    consent_token_id: str = Query(default=""),
     full_name: str = Query(default=""),
     dependants: str = Query(default=""),
     primary_facility: str = Query(default=""),
+    correction_attempts: int = Query(default=0),
+    unclear_attempt: int = Query(default=0),
     RecordingUrl: str = Form(default=""),
+    CallSid: str = Form(default=""),
 ):
-    """Handle the yes/no confirmation after the TTS read-back summary."""
+    """Handle the yes/no confirmation after the TTS read-back summary.
+
+    Runs ASR + classification in background, then persists on "yes" or
+    restarts the form on "no" (capped at 2 corrections).
+    """
     await _validate_twilio_request(request)
     print(f"[IVR SERVICE CONFIRM] <<< Confirmation recording received: {RecordingUrl[:80] if RecordingUrl else '(none)'}", flush=True)
-    print(f"[IVR SERVICE CONFIRM] Final answers: name='{full_name}', dependants='{dependants}', facility='{primary_facility}'", flush=True)
+    print(f"[IVR SERVICE CONFIRM] Final answers: name='{full_name}', dependants='{dependants}', facility='{primary_facility}' (correction={correction_attempts}, unclear={unclear_attempt})", flush=True)
     response = VoiceResponse()
 
-    # In production: transcribe RecordingUrl, check for "yes"/"ndiyo"
-    # For prototype: assume confirmed
-    print("[IVR SERVICE CONFIRM] >>> Playing: 'Your form is complete. Thank you for using VeriVoice.' — hanging up", flush=True)
+    if not RecordingUrl:
+        # No recording — treat as unclear, redirect to summary retry
+        response.redirect(
+            f"/twilio/voice/service?lang={lang}&question_index=3"
+            f"&citizen_id={citizen_id}&consent_token_id={consent_token_id}"
+            f"&full_name={full_name}&dependants={dependants}"
+            f"&primary_facility={primary_facility}"
+            f"&correction_attempts={correction_attempts}&unclear_attempt={unclear_attempt}",
+            method="POST",
+        )
+        return _twiml_response(response)
+
+    asyncio.create_task(_run_service_confirm_pipeline(
+        RecordingUrl, citizen_id, consent_token_id, lang,
+        full_name, dependants, primary_facility,
+        correction_attempts, unclear_attempt, CallSid,
+    ))
+
     _say_or_play(
         response,
-        "Fomu yako imekamilika. Asante kwa kutumia VeriVoice."
-        if lang == "sw"
-        else "Your form is complete. Thank you for using VeriVoice.",
+        "Uthibitisho unachakatwa." if lang == "sw" else "Processing your confirmation.",
         lang,
     )
+    wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
+    for _ in range(15):
+        response.pause(length=3)
+        _say_or_play(response, wait_msg, lang)
     response.hangup()
+    return _twiml_response(response)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VERIFY IDENTITY (MOSIP e-Signet magic-link flow)
+# ═════════════════════════════════════════════════════════════════════════════
+
+from app.services.mosip_service import MosipService  # noqa: E402
+from twilio.rest import Client as _TwilioRestClient  # noqa: E402
+
+_mosip_service = MosipService()
+
+
+def _send_sms_link(to_phone: str, link: str, lang: str) -> None:
+    """Send the eSignet magic link via Twilio SMS."""
+    if lang == "sw":
+        body = f"VeriVoice: Fungua kiungo kuthibitisha kitambulisho chako: {link}"
+    else:
+        body = f"VeriVoice: Open this link to verify your identity: {link}"
+    client = _TwilioRestClient(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+    client.messages.create(
+        to=to_phone,
+        from_=settings.TWILIO_PHONE_NUMBER,
+        body=body,
+    )
+
+
+@router.post("/voice/verify/start")
+async def verify_start(
+    request: Request,
+    lang: str = Query(default="en"),
+    CallSid: str = Form(...),
+    From: str = Form(...),
+):
+    """Send SMS with eSignet authorize URL, then poll for verification."""
+    await _validate_twilio_request(request)
+    print(f"[IVR VERIFY] >>> Starting verify flow for call={CallSid}, phone={From}", flush=True)
+
+    # Generate the authorize URL and bind it to this call
+    result = _mosip_service.get_authorize_url(call_sid=CallSid)
+    state = result["state"]
+    authorize_url = result["authorize_url"]
+    print(f"[IVR VERIFY] state={state}, url={authorize_url[:80]}...", flush=True)
+
+    # Send SMS to the caller
+    try:
+        _send_sms_link(From, authorize_url, lang)
+        print(f"[IVR VERIFY] SMS sent to {From}", flush=True)
+    except Exception as exc:
+        print(f"[IVR VERIFY] SMS failed: {exc}", flush=True)
+        response = VoiceResponse()
+        _say_or_play(
+            response,
+            "Imeshindikana kutuma SMS. Tafadhali jaribu tena." if lang == "sw"
+            else "Failed to send SMS. Please try again later.",
+            lang,
+        )
+        response.hangup()
+        return _twiml_response(response)
+
+    # Tell the caller to check their phone, then start polling
+    response = VoiceResponse()
+    if lang == "sw":
+        prompt = ("Nimekutumia kiungo cha SMS. Tafadhali fungua kiungo hicho, "
+                  "ingia kwa kitambulisho chako cha taifa, kisha rudi kwenye simu hii. "
+                  "Nitasubiri.")
+    else:
+        prompt = ("I have sent you a link by SMS. Please open it, log in with your "
+                  "national identity, then return to this call. I will wait.")
+    _say_or_play(response, prompt, lang)
+    response.redirect(f"/twilio/voice/verify/poll?lang={lang}&state={state}&tries=0", method="POST")
+    return _twiml_response(response)
+
+
+@router.post("/voice/verify/poll")
+async def verify_poll(
+    request: Request,
+    lang: str = Query(default="en"),
+    state: str = Query(...),
+    tries: int = Query(default=0),
+):
+    """Poll Redis for the verified individual_id. Loops until found or timeout."""
+    await _validate_twilio_request(request)
+    MAX_TRIES = 20  # ~20 * 5s pauses = ~100s total
+    individual_id = _mosip_service.get_verified_identity(state)
+    print(f"[IVR VERIFY POLL] state={state[:8]}... tries={tries} "
+          f"verified={'YES' if individual_id else 'NO'}", flush=True)
+
+    response = VoiceResponse()
+
+    if individual_id:
+        print(f"[IVR VERIFY] >>> Verified! individual_id={individual_id}", flush=True)
+        if lang == "sw":
+            msg = "Kitambulisho chako kimethibitishwa. Asante kwa kutumia VeriVoice."
+        else:
+            msg = "Your identity has been verified. Thank you for using VeriVoice."
+        _say_or_play(response, msg, lang)
+        response.hangup()
+        return _twiml_response(response)
+
+    if tries >= MAX_TRIES:
+        print(f"[IVR VERIFY] >>> Timeout after {tries} polls", flush=True)
+        if lang == "sw":
+            msg = "Muda umeisha. Tafadhali piga simu tena."
+        else:
+            msg = "Verification timed out. Please call again."
+        _say_or_play(response, msg, lang)
+        response.hangup()
+        return _twiml_response(response)
+
+    # Not verified yet — wait and poll again
+    if tries > 0 and tries % 3 == 0:
+        _say_or_play(
+            response,
+            "Bado ninasubiri uthibitisho." if lang == "sw"
+            else "Still waiting for verification.",
+            lang,
+        )
+    response.pause(length=5)
+    response.redirect(
+        f"/twilio/voice/verify/poll?lang={lang}&state={state}&tries={tries + 1}",
+        method="POST",
+    )
     return _twiml_response(response)

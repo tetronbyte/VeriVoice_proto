@@ -38,11 +38,17 @@ class Settings(BaseSettings):
 
     # MOSIP e-Signet (OIDC)
     ESIGNET_BASE_URL: str = ""
+    ESIGNET_UI_URL: str = ""
+    ESIGNET_ISSUER: str = ""
     ESIGNET_CLIENT_ID: str = ""
     ESIGNET_CLIENT_SECRET: str = ""
     ESIGNET_REDIRECT_URI: str = "http://localhost:8000/api/v1/mosip/callback"
     ESIGNET_JWKS_URI: str = ""
     ESIGNET_SCOPES: str = "openid profile"
+    ESIGNET_PRIVATE_KEY_PATH: str = ""
+
+    # Public base URL for this server (ngrok URL in dev) — used in SMS links
+    PUBLIC_BASE_URL: str = ""
 
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -59,7 +65,7 @@ class Settings(BaseSettings):
     # Streamlit (used by frontend, but matched in .env)
     BACKEND_URL: str = "http://localhost:8000"
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 settings = Settings()

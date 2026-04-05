@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from app.models.auth_event import AuthEvent
 from app.models.citizen import Citizen
 from app.models.consent_token import ConsentToken
+from app.models.service_form import ServiceForm
 from app.models.voice_template import VoiceTemplate
 
 
@@ -139,3 +140,34 @@ def revoke_consent_token(db: Session, token_id: str) -> ConsentToken | None:
     db.commit()
     db.refresh(token)
     return token
+
+
+# ── ServiceForm ──────────────────────────────────────────────────────────────
+
+def create_service_form(
+    db: Session,
+    citizen_id: str,
+    consent_token_id: str,
+    ministry_code: str,
+    form_type: str,
+    full_name: str,
+    dependants: int,
+    primary_facility: str,
+) -> ServiceForm:
+    form = ServiceForm(
+        citizen_id=citizen_id,
+        consent_token_id=consent_token_id,
+        ministry_code=ministry_code,
+        form_type=form_type,
+        full_name=full_name,
+        dependants=dependants,
+        primary_facility=primary_facility,
+    )
+    db.add(form)
+    db.commit()
+    db.refresh(form)
+    return form
+
+
+def get_service_form(db: Session, form_id: str) -> ServiceForm | None:
+    return db.query(ServiceForm).filter(ServiceForm.form_id == form_id).first()
