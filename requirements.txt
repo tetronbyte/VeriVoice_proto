@@ -23,6 +23,7 @@ streamlit
 httpx
 authlib
 python-jose[cryptography]
+PyJWT[crypto]
 twilio
 transformers
 unidecode

@@ -47,9 +47,6 @@ class Settings(BaseSettings):
     ESIGNET_SCOPES: str = "openid profile"
     ESIGNET_PRIVATE_KEY_PATH: str = ""
 
-    # Public base URL for this server (ngrok URL in dev) — used in SMS links
-    PUBLIC_BASE_URL: str = ""
-
     # Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 

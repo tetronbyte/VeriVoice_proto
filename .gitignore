@@ -16,6 +16,13 @@ build/
 
 # Keys (sensitive)
 keys/
+esignet_private_key.pem
+esignet_public_key.jwk
+
+# eSignet/IVR dev artifacts (regenerate locally)
+cookies.txt
+create_client.json
+create_user.json
 
 # ML model weights (downloaded at runtime)
 speechbrain_spkrec-ecapa-voxceleb/

@@ -2,9 +2,14 @@
 
 import secrets
 import json
+import time
+import uuid
+from pathlib import Path
 
 import httpx
 import redis
+import jwt as pyjwt
+from jwt import PyJWKClient, InvalidTokenError
 from jose import jwt, JWTError
 
 from app.config import settings
@@ -19,10 +24,28 @@ class MosipService:
 
     # ── OIDC State Management ───────────────────────────────────────────────
 
-    def store_oidc_context(self, state: str, nonce: str) -> None:
-        """Store OIDC state→nonce mapping in Redis with 5-min TTL."""
-        key = f"esignet:state:{state}"
-        self._redis.setex(key, _OIDC_TTL_SECONDS, nonce)
+    def store_oidc_context(self, state: str, nonce: str, call_sid: str | None = None) -> None:
+        """Store OIDC state→nonce mapping in Redis with 5-min TTL.
+
+        If `call_sid` is provided, also maps state→call_sid so the IVR flow
+        can correlate the OIDC callback back to the originating phone call.
+        """
+        self._redis.setex(f"esignet:state:{state}", _OIDC_TTL_SECONDS, nonce)
+        if call_sid:
+            self._redis.setex(f"esignet:state_call:{state}", _OIDC_TTL_SECONDS, call_sid)
+
+    def store_verified_identity(self, state: str, individual_id: str) -> None:
+        """Mark an OIDC state as verified with the MOSIP individual_id.
+
+        IVR poll endpoints read this to detect when a call can proceed.
+        """
+        self._redis.setex(
+            f"esignet:verified_state:{state}", _OIDC_TTL_SECONDS, individual_id
+        )
+
+    def get_verified_identity(self, state: str) -> str | None:
+        """Look up the verified individual_id for a given state, or None."""
+        return self._redis.get(f"esignet:verified_state:{state}")
 
     def consume_oidc_context(self, state: str) -> str:
         """Retrieve and delete the nonce for a given state (one-time use).
@@ -30,22 +53,29 @@ class MosipService:
         Raises ValueError if state not found or already consumed.
         """
         key = f"esignet:state:{state}"
-        nonce = self._redis.getdel(key)
+        # Atomic GET+DEL via pipeline (GETDEL requires Redis 6.2+)
+        pipe = self._redis.pipeline()
+        pipe.get(key)
+        pipe.delete(key)
+        nonce, _ = pipe.execute()
         if nonce is None:
             raise ValueError("Invalid or expired OIDC state")
         return nonce
 
     # ── Authorize ───────────────────────────────────────────────────────────
 
-    def get_authorize_url(self) -> dict:
+    def get_authorize_url(self, call_sid: str | None = None) -> dict:
         """Build e-Signet /authorize URL with generated state and nonce.
+
+        If `call_sid` is provided, the state is also mapped to that call,
+        enabling IVR flows to look up verification status by state.
 
         Returns {authorize_url, state, nonce}.
         """
         state = secrets.token_urlsafe(32)
         nonce = secrets.token_urlsafe(32)
 
-        self.store_oidc_context(state, nonce)
+        self.store_oidc_context(state, nonce, call_sid=call_sid)
 
         params = {
             "response_type": "code",
@@ -56,7 +86,8 @@ class MosipService:
             "nonce": nonce,
         }
         query = "&".join(f"{k}={v}" for k, v in params.items())
-        authorize_url = f"{settings.ESIGNET_BASE_URL}/v1/esignet/authorize?{query}"
+        ui_url = getattr(settings, "ESIGNET_UI_URL", settings.ESIGNET_BASE_URL)
+        authorize_url = f"{ui_url}/authorize?{query}"
 
         return {"authorize_url": authorize_url, "state": state, "nonce": nonce}
 
@@ -68,13 +99,40 @@ class MosipService:
         Returns the full token response dict (id_token, access_token, etc.).
         """
         token_url = f"{settings.ESIGNET_BASE_URL}/v1/esignet/oauth/v2/token"
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": settings.ESIGNET_REDIRECT_URI,
-            "client_id": settings.ESIGNET_CLIENT_ID,
-            "client_secret": settings.ESIGNET_CLIENT_SECRET,
-        }
+
+        # private_key_jwt: sign a JWT assertion with our RSA private key
+        private_key_path = getattr(settings, "ESIGNET_PRIVATE_KEY_PATH", "")
+        if private_key_path and Path(private_key_path).exists():
+            now = int(time.time())
+            assertion_claims = {
+                "iss": settings.ESIGNET_CLIENT_ID,
+                "sub": settings.ESIGNET_CLIENT_ID,
+                "aud": token_url,
+                "jti": uuid.uuid4().hex,
+                "iat": now,
+                "exp": now + 300,
+            }
+            private_key_pem = Path(private_key_path).read_text()
+            client_assertion = jwt.encode(
+                assertion_claims, private_key_pem, algorithm="RS256"
+            )
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": settings.ESIGNET_REDIRECT_URI,
+                "client_id": settings.ESIGNET_CLIENT_ID,
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": client_assertion,
+            }
+        else:
+            # Fallback: client_secret_post
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": settings.ESIGNET_REDIRECT_URI,
+                "client_id": settings.ESIGNET_CLIENT_ID,
+                "client_secret": settings.ESIGNET_CLIENT_SECRET,
+            }
         async with httpx.AsyncClient() as client:
             resp = await client.post(token_url, data=data)
             resp.raise_for_status()
@@ -128,12 +186,27 @@ class MosipService:
         """
         key_set = self._fetch_jwks_sync(jwks)
 
-        claims = jwt.decode(
+        # Use PyJWT (supports PS256, which python-jose does not).
+        # Find the signing key from JWKS by kid.
+        unverified_header = pyjwt.get_unverified_header(id_token)
+        token_kid = unverified_header.get("kid")
+        token_alg = unverified_header.get("alg", "PS256")
+
+        signing_key = None
+        for k in key_set.get("keys", []):
+            if k.get("kid") == token_kid:
+                signing_key = pyjwt.PyJWK(k, algorithm=token_alg).key
+                break
+        if signing_key is None:
+            raise ValueError(f"No matching JWKS key for kid={token_kid}")
+
+        expected_issuer = settings.ESIGNET_ISSUER or settings.ESIGNET_BASE_URL
+        claims = pyjwt.decode(
             id_token,
-            key_set,
-            algorithms=["RS256"],
+            signing_key,
+            algorithms=["RS256", "RS384", "RS512", "PS256", "PS384", "PS512"],
             audience=settings.ESIGNET_CLIENT_ID,
-            issuer=settings.ESIGNET_BASE_URL,
+            issuer=expected_issuer,
             options={"verify_exp": True, "verify_aud": True, "verify_iss": True},
         )
 

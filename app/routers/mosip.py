@@ -69,7 +69,10 @@ async def mosip_callback(
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"JWT validation failed: {exc}")
 
-    # Store verified MOSIP ID in Redis so enrollment can reference it (5-min TTL)
+    # Store verified MOSIP ID keyed by state so IVR poll endpoints can read it
+    _mosip_service.store_verified_identity(state, individual_id)
+
+    # Also keep the legacy per-individual marker (5-min TTL)
     import redis as _redis_mod
     from app.config import settings as _settings
     _r = _redis_mod.from_url(_settings.REDIS_URL, decode_responses=True)
