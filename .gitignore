@@ -41,6 +41,9 @@ Thumbs.db
 *.tmp
 temp/
 
+# Large videos (over GitHub's 100MB limit — host externally)
+VeriVoice_tech_demo.mp4
+
 # gTTS generated audio (served to Twilio for Swahili IVR prompts)
 tts_audio/
 
