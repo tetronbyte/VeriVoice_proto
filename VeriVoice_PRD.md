@@ -133,19 +133,31 @@ marked as identity-verified with their MOSIP individual ID linked.
 
 5.1.1 MOSIP e-Signet Identity Verification
 
-Before or after voice enrollment, a citizen's identity can be verified
-against the MOSIP national ID system via the e-Signet OpenID Connect flow:
+Before voice enrollment, a citizen's identity is verified against the
+MOSIP national ID system via e-Signet. The prototype supports two flows:
 
-1.  VeriVoice redirects the citizen to the e-Signet authorization endpoint.
-2.  The citizen authenticates on the e-Signet page using MOSIP biometrics
-    (fingerprint, iris, or face) captured via an SBI-compliant device
-    (Mock MDS in development, real hardware in production).
-3.  e-Signet redirects back to VeriVoice with an authorization code.
-4.  VeriVoice exchanges the code for an id_token at e-Signet's token
-    endpoint.
-5.  VeriVoice validates the JWT signature against MOSIP's public key (JWKS).
-6.  The verified `sub` claim (MOSIP individual_id) is extracted and linked
-    to the citizen's record, setting `identity_verified=True`.
+**(a) Browser OIDC (Streamlit / web):** Standard OpenID Connect
+authorization code flow with `private_key_jwt` client authentication —
+VeriVoice redirects the citizen to e-Signet's login page, the citizen
+authenticates via MOSIP biometrics (fingerprint/iris/face through an
+SBI-compliant device, Mock MDS in development), e-Signet redirects back
+with an authorization code, VeriVoice exchanges it for an id_token
+(PS256-signed), validates the JWT (signature via JWKS, exp, aud, iss,
+nonce), and extracts the verified `sub` claim (MOSIP individual_id).
+
+**(b) DTMF direct OTP (IVR / phone):** Since phone calls cannot render a
+browser, the IVR flow calls e-Signet's server-driven OAuth endpoints
+directly. After the caller enters their national ID on the keypad,
+VeriVoice: creates an oauth-details transaction (with PKCE S256), asks
+e-Signet to send the OTP (`send-otp`), collects the OTP over DTMF,
+submits it via `authenticate` + `auth-code`, exchanges the resulting
+code for an id_token (using the same `private_key_jwt` + PKCE
+`code_verifier`), validates the JWT, and extracts `sub`. The caller
+never leaves the phone call — no SMS, no browser redirect, no public
+URLs required for e-Signet.
+
+In both flows the verified MOSIP individual_id is linked to the new
+CITIZEN record (`mosip_individual_id` + `identity_verified=True`).
 
 5.2 Voice Authentication (Every-Time Access)
 
@@ -274,11 +286,19 @@ embedding) → L2-normalise → HE scalar multiply with stored ciphertext →
 Decrypt dot product → Score vs. threshold + ASR transcript (Whisper for
 English, w2v-BERT for Swahili) vs. challenge phrase → Verdict
 
-MOSIP e-Signet Identity Verification: VeriVoice redirects to e-Signet
-/authorize → citizen authenticates via MOSIP biometrics (SBI device /
-Mock MDS) → e-Signet returns authorization code → VeriVoice exchanges
-code for id_token → validates JWT → extracts verified sub
-(individual_id) → links to CITIZEN record
+MOSIP e-Signet Identity Verification (browser OIDC): VeriVoice redirects
+to e-Signet /authorize → citizen authenticates via MOSIP (OTP / password
+/ biometrics) → e-Signet returns authorization code → VeriVoice
+exchanges code for id_token (private_key_jwt) → validates PS256 JWT →
+extracts verified sub (individual_id) → links to CITIZEN record
+
+MOSIP e-Signet Identity Verification (IVR DTMF OTP): Caller enters
+national ID via keypad → backend calls e-Signet oauth-details +
+send-otp (server-driven OAuth with PKCE) → caller enters 6-digit OTP
+via keypad → backend calls authenticate + auth-code + token → validates
+id_token → extracts verified sub → redirects call into voice
+enrollment with national_id pre-filled → CITIZEN row linked to
+mosip_individual_id + identity_verified=True
 
 Consent: gTTS plays consent text → User speaks response → Voice auth
 pipeline → Ed25519 sign consent token → Store token

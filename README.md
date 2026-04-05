@@ -9,8 +9,10 @@ VeriVoice augments existing national ID systems (Kenya's Huduma Namba, Uganda's 
 ## How It Works
 
 ```
-Identity:       (optional) MOSIP e-Signet OIDC -> verify citizen via national ID biometrics
+Identity:       MOSIP e-Signet OTP verification (DTMF over phone, no browser)
+                -> verifies citizen via national ID before voice enrollment
 Enrollment:     5 voice samples -> ECAPA-TDNN (192-dim) -> Paillier HE encrypt -> store ciphertext
+                -> linked to verified mosip_individual_id
 Authentication: voice + phrase -> biometric match (HE dot product) + Whisper ASR transcript check
 Consent:        voice auth -> Ed25519 sign consent token -> store in DB
 Service Access: verify consent token -> voice Q&A via Whisper ASR
@@ -111,11 +113,16 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 | Endpoint | Description |
 |---|---|
 | `/twilio/voice/welcome` | Welcome + language selection |
+| `/twilio/voice/verify/start` | DTMF identity verification — prompt for national ID |
+| `/twilio/voice/verify/nid` | Trigger eSignet OTP for entered national ID |
+| `/twilio/voice/verify/otp` | Verify OTP via eSignet, redirect to enrollment |
 | `/twilio/voice/enroll` | National ID input + 5 random-phrase enrollment via `<Record>` |
 | `/twilio/voice/authenticate` | National ID input + challenge phrase + real auth pipeline (1 retry on denied) |
 | `/twilio/voice/consent` | Verbal consent recording |
 | `/twilio/voice/service` | Health insurance form Q&A (3 questions + read-back) |
 | `/twilio/voice/service/confirm` | Yes/no confirmation after TTS summary |
+
+**IVR identity verification (DTMF):** From the main menu, pressing **3** starts an eSignet-backed identity check using only the phone keypad. The IVR prompts for the national ID, calls eSignet's server-driven OAuth (`oauth-details` → `send-otp` → `authenticate` → `auth-code` → token), and extracts a verified MOSIP `individual_id` from the signed id_token. On success the call proceeds directly into voice enrollment, and the new `CITIZEN` row is created with `mosip_individual_id` + `identity_verified=True`. No SMS, no browser, no public URLs for eSignet — the whole flow happens on the call. See `docs/ivr_verify_flow.md`.
 
 **Full call continuity:** After successful authentication, the IVR stays in the same call and flows through consent → service access (health insurance form) → summary → goodbye. On auth denial, the caller gets one retry; if denied again, the call ends.
 

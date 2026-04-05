@@ -1,5 +1,7 @@
 """MosipService — OIDC client for MOSIP e-Signet identity verification."""
 
+import base64
+import hashlib
 import secrets
 import json
 import time
@@ -93,8 +95,11 @@ class MosipService:
 
     # ── Token Exchange ──────────────────────────────────────────────────────
 
-    async def exchange_code(self, code: str) -> dict:
+    async def exchange_code(self, code: str, code_verifier: str | None = None) -> dict:
         """Exchange authorization code for tokens at e-Signet /token endpoint.
+
+        If `code_verifier` is provided, the PKCE code_verifier is sent with the
+        request (required by server-driven OAuth flows that used code_challenge).
 
         Returns the full token response dict (id_token, access_token, etc.).
         """
@@ -124,6 +129,8 @@ class MosipService:
                 "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
                 "client_assertion": client_assertion,
             }
+            if code_verifier:
+                data["code_verifier"] = code_verifier
         else:
             # Fallback: client_secret_post
             data = {
@@ -228,3 +235,189 @@ class MosipService:
         if not sub:
             raise ValueError("id_token missing 'sub' claim")
         return sub
+
+    # ── Server-driven OTP flow (DTMF / IVR) ─────────────────────────────────
+
+    @staticmethod
+    def _pkce_pair() -> tuple[str, str]:
+        """Generate a PKCE code_verifier + code_challenge (S256)."""
+        verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+        challenge = base64.urlsafe_b64encode(
+            hashlib.sha256(verifier.encode()).digest()
+        ).rstrip(b"=").decode()
+        return verifier, challenge
+
+    @staticmethod
+    def _compute_oauth_details_hash(response_obj: dict) -> str:
+        """Compute oauth-details-hash = base64url(sha256(JSON.stringify(response)))."""
+        payload = json.dumps(response_obj, separators=(",", ":"))
+        digest = hashlib.sha256(payload.encode()).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+    async def start_otp_auth(self, individual_id: str) -> dict:
+        """Step 1-3 of server-driven OAuth: CSRF → oauth-details → send-otp.
+
+        Returns a dict with {transaction_id, oauth_details_key, oauth_details_hash,
+        code_verifier, nonce, state, cookies_jar} to be held in Redis until the
+        user enters their OTP.
+        """
+        base = settings.ESIGNET_BASE_URL
+        verifier, challenge = self._pkce_pair()
+        nonce = secrets.token_urlsafe(16)
+        state = secrets.token_urlsafe(16)
+
+        async with httpx.AsyncClient() as client:
+            # CSRF token
+            r = await client.get(f"{base}/v1/esignet/csrf/token")
+            r.raise_for_status()
+            csrf_token = r.json()["token"]
+            cookies = {c.name: c.value for c in r.cookies.jar}
+
+            # oauth-details
+            payload = {
+                "requestTime": _now_iso(),
+                "request": {
+                    "clientId": settings.ESIGNET_CLIENT_ID,
+                    "scope": settings.ESIGNET_SCOPES,
+                    "responseType": "code",
+                    "redirectUri": settings.ESIGNET_REDIRECT_URI,
+                    "display": "popup",
+                    "prompt": "login",
+                    "acrValues": "mosip:idp:acr:generated-code",
+                    "claims": {"userinfo": {}, "id_token": {}},
+                    "nonce": nonce,
+                    "state": state,
+                    "claimsLocales": "en",
+                    "codeChallenge": challenge,
+                    "codeChallengeMethod": "S256",
+                },
+            }
+            r = await client.post(
+                f"{base}/v1/esignet/authorization/v3/oauth-details",
+                json=payload,
+                headers={"X-XSRF-TOKEN": csrf_token},
+                cookies=cookies,
+            )
+            r.raise_for_status()
+            oauth_resp = r.json()["response"]
+            transaction_id = oauth_resp["transactionId"]
+            oauth_hash = self._compute_oauth_details_hash(oauth_resp)
+            cookies = {c.name: c.value for c in r.cookies.jar} or cookies
+
+            # send-otp
+            otp_payload = {
+                "requestTime": _now_iso(),
+                "request": {
+                    "transactionId": transaction_id,
+                    "individualId": individual_id,
+                    "otpChannels": ["email", "phone"],
+                    "captchaToken": "dummy",
+                },
+            }
+            r = await client.post(
+                f"{base}/v1/esignet/authorization/send-otp",
+                json=otp_payload,
+                headers={
+                    "X-XSRF-TOKEN": csrf_token,
+                    "oauth-details-key": transaction_id,
+                    "oauth-details-hash": oauth_hash,
+                },
+                cookies=cookies,
+            )
+            r.raise_for_status()
+            send_body = r.json()
+            if send_body.get("errors"):
+                raise ValueError(f"send-otp failed: {send_body['errors']}")
+
+        return {
+            "transaction_id": transaction_id,
+            "oauth_details_key": transaction_id,
+            "oauth_details_hash": oauth_hash,
+            "csrf_token": csrf_token,
+            "cookies": cookies,
+            "code_verifier": verifier,
+            "nonce": nonce,
+            "state": state,
+        }
+
+    async def verify_otp_and_get_identity(
+        self,
+        session: dict,
+        individual_id: str,
+        otp: str,
+    ) -> str:
+        """Step 4-7 of server-driven OAuth: authenticate → auth-code → tokens → validate.
+
+        `session` is the dict returned by `start_otp_auth`.
+        Returns the verified MOSIP individual_id (sub claim from id_token).
+        """
+        base = settings.ESIGNET_BASE_URL
+        tx = session["transaction_id"]
+        csrf = session["csrf_token"]
+        cookies = session["cookies"]
+        headers = {
+            "X-XSRF-TOKEN": csrf,
+            "oauth-details-key": session["oauth_details_key"],
+            "oauth-details-hash": session["oauth_details_hash"],
+        }
+
+        async with httpx.AsyncClient() as client:
+            # authenticate
+            auth_payload = {
+                "requestTime": _now_iso(),
+                "request": {
+                    "transactionId": tx,
+                    "individualId": individual_id,
+                    "challengeList": [
+                        {
+                            "authFactorType": "OTP",
+                            "challenge": otp,
+                            "format": "alpha-numeric",
+                        }
+                    ],
+                },
+            }
+            r = await client.post(
+                f"{base}/v1/esignet/authorization/v3/authenticate",
+                json=auth_payload,
+                headers=headers,
+                cookies=cookies,
+            )
+            r.raise_for_status()
+            body = r.json()
+            if body.get("errors"):
+                raise ValueError(f"authenticate failed: {body['errors']}")
+
+            # auth-code
+            ac_payload = {
+                "requestTime": _now_iso(),
+                "request": {
+                    "transactionId": tx,
+                    "acceptedClaims": [],
+                    "permittedAuthorizeScopes": [],
+                },
+            }
+            r = await client.post(
+                f"{base}/v1/esignet/authorization/auth-code",
+                json=ac_payload,
+                headers=headers,
+                cookies=cookies,
+            )
+            r.raise_for_status()
+            ac_body = r.json()
+            if ac_body.get("errors"):
+                raise ValueError(f"auth-code failed: {ac_body['errors']}")
+            code = ac_body["response"]["code"]
+
+        # Exchange code + PKCE verifier for id_token
+        token_response = await self.exchange_code(code, code_verifier=session["code_verifier"])
+        id_token = token_response.get("id_token")
+        if not id_token:
+            raise ValueError("No id_token in token response")
+        return self.get_individual_id(id_token, session["nonce"])
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp with millis, matching eSignet's requestTime format."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")

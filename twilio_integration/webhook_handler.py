@@ -371,8 +371,30 @@ async def _run_enrollment_pipeline(job_id: str, recording_urls: list[str],
                 emb[:] = 0.0
             embeddings.clear()
 
-            citizen = create_citizen(db, national_id_number=national_id,
-                                     preferred_language=lang, phone_number="")
+            # If the caller verified their identity via eSignet earlier in this
+            # call, link the verified MOSIP individual_id to the new citizen.
+            mosip_individual_id = None
+            identity_verified = False
+            try:
+                raw = _redis_client.get(f"ivr:verified_identity:{call_sid}")
+                if raw:
+                    vdata = json.loads(raw)
+                    if vdata.get("national_id") == national_id:
+                        mosip_individual_id = vdata.get("mosip_individual_id")
+                        identity_verified = True
+                        print(f"[ENROLL BG {job_id}] Linking verified MOSIP id "
+                              f"{mosip_individual_id} to national_id={national_id}", flush=True)
+            except Exception as exc:
+                print(f"[ENROLL BG {job_id}] failed to read verified identity: {exc}", flush=True)
+
+            citizen = create_citizen(
+                db,
+                national_id_number=national_id,
+                preferred_language=lang,
+                phone_number="",
+                mosip_individual_id=mosip_individual_id,
+                identity_verified=identity_verified,
+            )
             template = create_voice_template(db, citizen_id=citizen.citizen_id,
                                               he_ciphertext=ciphertext_bytes)
             print(f"[ENROLL BG {job_id}] DONE — citizen={citizen.citizen_id} template={template.template_id}", flush=True)
@@ -1442,123 +1464,201 @@ async def service_confirm(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# VERIFY IDENTITY (MOSIP e-Signet magic-link flow)
+# VERIFY IDENTITY — DTMF-only eSignet OTP flow (no browser)
 # ═════════════════════════════════════════════════════════════════════════════
+#
+# Flow:
+#   1. /voice/verify/start       — prompt for national ID via DTMF
+#   2. /voice/verify/nid         — receive NID, call eSignet to send OTP,
+#                                  store session in Redis keyed by CallSid
+#   3. /voice/verify/otp         — receive OTP, verify with eSignet,
+#                                  on success redirect to /voice/enroll
+#                                  with the verified national_id pre-filled.
 
 from app.services.mosip_service import MosipService  # noqa: E402
-from twilio.rest import Client as _TwilioRestClient  # noqa: E402
 
 _mosip_service = MosipService()
 
+_VERIFY_SESSION_TTL = 600  # 10 min
 
-def _send_sms_link(to_phone: str, link: str, lang: str) -> None:
-    """Send the eSignet magic link via Twilio SMS."""
-    if lang == "sw":
-        body = f"VeriVoice: Fungua kiungo kuthibitisha kitambulisho chako: {link}"
-    else:
-        body = f"VeriVoice: Open this link to verify your identity: {link}"
-    client = _TwilioRestClient(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-    client.messages.create(
-        to=to_phone,
-        from_=settings.TWILIO_PHONE_NUMBER,
-        body=body,
-    )
+
+def _verify_session_key(call_sid: str) -> str:
+    return f"ivr:verify_session:{call_sid}"
 
 
 @router.post("/voice/verify/start")
 async def verify_start(
     request: Request,
     lang: str = Query(default="en"),
-    CallSid: str = Form(...),
-    From: str = Form(...),
+    CallSid: str = Form(default=""),
 ):
-    """Send SMS with eSignet authorize URL, then poll for verification."""
+    """Prompt the caller to enter their national ID via DTMF."""
     await _validate_twilio_request(request)
-    print(f"[IVR VERIFY] >>> Starting verify flow for call={CallSid}, phone={From}", flush=True)
+    print(f"[IVR VERIFY START] >>> call={CallSid} lang={lang}", flush=True)
 
-    # Generate the authorize URL and bind it to this call
-    result = _mosip_service.get_authorize_url(call_sid=CallSid)
-    state = result["state"]
-    authorize_url = result["authorize_url"]
-    print(f"[IVR VERIFY] state={state}, url={authorize_url[:80]}...", flush=True)
-
-    # Send SMS to the caller
-    try:
-        _send_sms_link(From, authorize_url, lang)
-        print(f"[IVR VERIFY] SMS sent to {From}", flush=True)
-    except Exception as exc:
-        print(f"[IVR VERIFY] SMS failed: {exc}", flush=True)
-        response = VoiceResponse()
-        _say_or_play(
-            response,
-            "Imeshindikana kutuma SMS. Tafadhali jaribu tena." if lang == "sw"
-            else "Failed to send SMS. Please try again later.",
-            lang,
-        )
-        response.hangup()
-        return _twiml_response(response)
-
-    # Tell the caller to check their phone, then start polling
     response = VoiceResponse()
-    if lang == "sw":
-        prompt = ("Nimekutumia kiungo cha SMS. Tafadhali fungua kiungo hicho, "
-                  "ingia kwa kitambulisho chako cha taifa, kisha rudi kwenye simu hii. "
-                  "Nitasubiri.")
-    else:
-        prompt = ("I have sent you a link by SMS. Please open it, log in with your "
-                  "national identity, then return to this call. I will wait.")
-    _say_or_play(response, prompt, lang)
-    response.redirect(f"/twilio/voice/verify/poll?lang={lang}&state={state}&tries=0", method="POST")
+    gather = Gather(
+        action=f"/twilio/voice/verify/nid?lang={lang}",
+        method="POST",
+        finish_on_key="#",
+        timeout=10,
+    )
+    prompt = (
+        "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #."
+        if lang == "sw"
+        else "Please enter your national identity number followed by the pound key."
+    )
+    _say_or_play(gather, prompt, lang)
+    response.append(gather)
+    # If nothing entered, loop back
+    response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
     return _twiml_response(response)
 
 
-@router.post("/voice/verify/poll")
-async def verify_poll(
+@router.post("/voice/verify/nid")
+async def verify_nid(
     request: Request,
     lang: str = Query(default="en"),
-    state: str = Query(...),
-    tries: int = Query(default=0),
+    CallSid: str = Form(default=""),
+    Digits: str = Form(default=""),
 ):
-    """Poll Redis for the verified individual_id. Loops until found or timeout."""
+    """Kick off eSignet OTP flow for the entered national ID, then prompt for OTP."""
     await _validate_twilio_request(request)
-    MAX_TRIES = 20  # ~20 * 5s pauses = ~100s total
-    individual_id = _mosip_service.get_verified_identity(state)
-    print(f"[IVR VERIFY POLL] state={state[:8]}... tries={tries} "
-          f"verified={'YES' if individual_id else 'NO'}", flush=True)
+    national_id = Digits.strip()
+    print(f"[IVR VERIFY NID] <<< call={CallSid} national_id={national_id}", flush=True)
+
+    response = VoiceResponse()
+    if not national_id:
+        _say_or_play(
+            response,
+            "Hukuingiza nambari yoyote." if lang == "sw" else "No number entered.",
+            lang,
+        )
+        response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
+        return _twiml_response(response)
+
+    # Call eSignet to send the OTP
+    try:
+        session = await _mosip_service.start_otp_auth(national_id)
+    except Exception as exc:
+        print(f"[IVR VERIFY NID] eSignet start_otp_auth failed: {exc}", flush=True)
+        _say_or_play(
+            response,
+            "Nambari ya kitambulisho haijatambuliwa. Tafadhali jaribu tena." if lang == "sw"
+            else "That identity could not be verified. Please try again.",
+            lang,
+        )
+        response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
+        return _twiml_response(response)
+
+    # Persist the eSignet session keyed by CallSid so the OTP step can finish it
+    _redis_client.setex(
+        _verify_session_key(CallSid),
+        _VERIFY_SESSION_TTL,
+        json.dumps({"national_id": national_id, "session": session}),
+    )
+    print(f"[IVR VERIFY NID] OTP sent, transaction_id={session['transaction_id']}", flush=True)
+
+    # Prompt for OTP
+    gather = Gather(
+        action=f"/twilio/voice/verify/otp?lang={lang}",
+        method="POST",
+        finish_on_key="#",
+        timeout=30,
+        num_digits=6,
+    )
+    _say_or_play(
+        gather,
+        "OTP imetumwa. Tafadhali ingiza OTP yenye tarakimu sita kisha bonyeza #."
+        if lang == "sw"
+        else "An OTP has been sent. Please enter the six-digit OTP followed by the pound key.",
+        lang,
+    )
+    response.append(gather)
+    # Timeout fallback
+    _say_or_play(
+        response,
+        "Hukuingiza OTP. Tafadhali piga simu tena." if lang == "sw"
+        else "No OTP entered. Please call again.",
+        lang,
+    )
+    response.hangup()
+    return _twiml_response(response)
+
+
+@router.post("/voice/verify/otp")
+async def verify_otp(
+    request: Request,
+    lang: str = Query(default="en"),
+    CallSid: str = Form(default=""),
+    Digits: str = Form(default=""),
+):
+    """Verify OTP with eSignet, then redirect into the voice enrollment flow."""
+    await _validate_twilio_request(request)
+    otp = Digits.strip()
+    print(f"[IVR VERIFY OTP] <<< call={CallSid} otp_len={len(otp)}", flush=True)
 
     response = VoiceResponse()
 
-    if individual_id:
-        print(f"[IVR VERIFY] >>> Verified! individual_id={individual_id}", flush=True)
-        if lang == "sw":
-            msg = "Kitambulisho chako kimethibitishwa. Asante kwa kutumia VeriVoice."
-        else:
-            msg = "Your identity has been verified. Thank you for using VeriVoice."
-        _say_or_play(response, msg, lang)
-        response.hangup()
-        return _twiml_response(response)
-
-    if tries >= MAX_TRIES:
-        print(f"[IVR VERIFY] >>> Timeout after {tries} polls", flush=True)
-        if lang == "sw":
-            msg = "Muda umeisha. Tafadhali piga simu tena."
-        else:
-            msg = "Verification timed out. Please call again."
-        _say_or_play(response, msg, lang)
-        response.hangup()
-        return _twiml_response(response)
-
-    # Not verified yet — wait and poll again
-    if tries > 0 and tries % 3 == 0:
+    raw = _redis_client.get(_verify_session_key(CallSid))
+    if not raw:
         _say_or_play(
             response,
-            "Bado ninasubiri uthibitisho." if lang == "sw"
-            else "Still waiting for verification.",
+            "Kipindi kimeisha. Tafadhali anza upya." if lang == "sw"
+            else "Session expired. Please start again.",
             lang,
         )
-    response.pause(length=5)
+        response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
+        return _twiml_response(response)
+    data = json.loads(raw)
+    national_id = data["national_id"]
+    session = data["session"]
+
+    if not otp:
+        _say_or_play(
+            response,
+            "Hukuingiza OTP." if lang == "sw" else "No OTP entered.",
+            lang,
+        )
+        response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
+        return _twiml_response(response)
+
+    try:
+        individual_id = await _mosip_service.verify_otp_and_get_identity(
+            session, national_id, otp
+        )
+    except Exception as exc:
+        print(f"[IVR VERIFY OTP] verification failed: {exc}", flush=True)
+        _say_or_play(
+            response,
+            "OTP si sahihi. Tafadhali jaribu tena." if lang == "sw"
+            else "OTP is incorrect. Please try again.",
+            lang,
+        )
+        response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
+        return _twiml_response(response)
+
+    print(f"[IVR VERIFY OTP] >>> Verified! individual_id={individual_id}", flush=True)
+
+    # Record the verification so enrollment can link it to the voice template
+    _redis_client.setex(
+        f"ivr:verified_identity:{CallSid}",
+        _VERIFY_SESSION_TTL,
+        json.dumps({"national_id": national_id, "mosip_individual_id": individual_id}),
+    )
+    # Cleanup session
+    _redis_client.delete(_verify_session_key(CallSid))
+
+    _say_or_play(
+        response,
+        "Kitambulisho chako kimethibitishwa. Sasa tutasajili sauti yako."
+        if lang == "sw"
+        else "Your identity has been verified. Now we will enroll your voice.",
+        lang,
+    )
+    # Jump into the enrollment flow with the verified national_id pre-filled
     response.redirect(
-        f"/twilio/voice/verify/poll?lang={lang}&state={state}&tries={tries + 1}",
+        f"/twilio/voice/enroll?lang={lang}&step=0&national_id={national_id}",
         method="POST",
     )
     return _twiml_response(response)

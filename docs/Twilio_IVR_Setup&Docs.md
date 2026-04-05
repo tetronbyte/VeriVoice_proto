@@ -316,9 +316,11 @@ If no input is received within 5 seconds, the system defaults to English.
 Twilio POSTs to: `POST /twilio/voice/welcome/language` with `Digits=1`
 
 The system plays:
-> "You selected English. Press 1 to enroll. Press 2 to authenticate."
+> "You selected English. Press 1 to enroll. Press 2 to authenticate. Press 3 to verify your identity."
 
-Amina is a first-time user, so she presses **1** to enroll.
+Amina is a first-time user. She can either:
+- Press **1** to enroll directly (manual national ID entry, `identity_verified=False`), **or**
+- Press **3** to verify her identity via e-Signet first (DTMF OTP flow), which then proceeds into enrollment with `identity_verified=True` + linked `mosip_individual_id`.
 
 **Step 3 — Route to enrollment**
 
@@ -334,7 +336,7 @@ Enrollment collects **5 voice samples** to build a voiceprint. For each sample, 
 
 > **IVR vs Streamlit:** The IVR flow plays random TTS-prompted phrases for enrollment. The Streamlit (web) flow does not use random phrases — users upload their own pre-recorded audio files instead. Both paths produce the same voice biometric (ECAPA-TDNN embedding centroid).
 
-> **MOSIP Integration Note:** In the web UI (Streamlit), citizens can optionally verify their identity via MOSIP e-Signet before enrollment, which sets `identity_verified=True` on their citizen record. The IVR flow uses manual national ID entry (keypad) and sets `identity_verified=False`. Both paths create valid voice enrollments — the MOSIP verification adds a stronger identity anchor but is not required.
+> **MOSIP Integration Note:** Citizens can verify their identity via MOSIP e-Signet in two ways: **(a)** Streamlit web UI using the browser OIDC flow, or **(b)** IVR DTMF OTP flow (Press **3** at the menu) where the entire verification happens on the phone call via e-Signet's server-driven OAuth endpoints. In both cases, successful verification sets `identity_verified=True` and links `mosip_individual_id` on the citizen record. Enrolling directly via Press 1 without verification still works but creates the citizen with `identity_verified=False`. See `docs/ivr_verify_flow.md` for the DTMF flow details.
 
 **Step 4 — Enter national ID**
 
@@ -603,7 +605,10 @@ All endpoints are mounted under the `/twilio` prefix and return TwiML XML.
 |---|---|---|---|
 | `/twilio/voice/welcome` | POST | Welcome message + language selection | -- |
 | `/twilio/voice/welcome/language` | POST | Handle language DTMF input | `Digits` (form) |
-| `/twilio/voice/welcome/action` | POST | Route to enroll or authenticate | `Digits` (form), `lang` (query) |
+| `/twilio/voice/welcome/action` | POST | Route to enroll, authenticate, or verify identity | `Digits` (form), `lang` (query) |
+| `/twilio/voice/verify/start` | POST | DTMF identity verification — prompt for national ID | `lang` (query) |
+| `/twilio/voice/verify/nid` | POST | Trigger eSignet OTP for entered national ID, prompt for OTP | `Digits` (form), `lang` (query) |
+| `/twilio/voice/verify/otp` | POST | Verify OTP with eSignet, redirect to enrollment with national_id pre-filled | `Digits` (form), `lang` (query) |
 | `/twilio/voice/enroll` | POST | National ID input or play random phrase + record | `lang`, `step`, `national_id` (query) |
 | `/twilio/voice/enroll/callback` | POST | Handle completed enrollment recording | `RecordingUrl` (form), `lang`, `step`, `national_id` (query) |
 | `/twilio/voice/authenticate` | POST | National ID input + challenge phrase + record | `lang`, `national_id`, `attempt` (query) |
@@ -624,7 +629,7 @@ The following endpoints are used by the Streamlit web UI and direct API callers,
 | `/api/v1/mosip/callback` | GET | Handle e-Signet redirect (exchange code for verified MOSIP ID) |
 | `/api/v1/mosip/link` | POST | Link verified MOSIP identity to an existing citizen |
 
-These enable identity-verified enrollment via the web UI. The IVR flow does not currently use MOSIP — callers enroll via keypad national ID entry.
+These enable identity-verified enrollment via the Streamlit web UI. The IVR flow has its own MOSIP verification path that uses eSignet's server-driven OAuth endpoints directly (DTMF OTP) — see `/twilio/voice/verify/*` above and `docs/ivr_verify_flow.md`.
 
 ## 11. IVR State Machine
 
@@ -648,6 +653,20 @@ WELCOME
                         |                           |
                         |                           v
                         |                     ENROLL_COMPLETE --> Hangup
+                        |
+                        +-- (Press 3) --> VERIFY_START
+                        |                     |
+                        |                     +-- Enter national ID (#) --> VERIFY_NID
+                        |                     |                                |
+                        |                     |                                +-- call eSignet send-otp
+                        |                     |                                v
+                        |                     +-- Enter 6-digit OTP (#) --> VERIFY_OTP
+                        |                                                      |
+                        |                                                      +-- call eSignet authenticate + auth-code + token
+                        |                                                      |
+                        |                                                      +-- success: redirect to ENROLL_PROMPT
+                        |                                                      |                (with national_id pre-filled)
+                        |                                                      +-- failure: back to VERIFY_START
                         |
                         +-- (Press 2) --> AUTH_NATIONAL_ID
                                               |
@@ -771,13 +790,62 @@ curl -X POST "http://localhost:8000/twilio/voice/service?lang=sw&question_index=
 
 ## 13. Testing MOSIP Identity Verification with IVR
 
-MOSIP e-Signet uses a browser-based OpenID Connect flow (citizen is redirected to the e-Signet login page to authenticate via fingerprint/iris/face). This means identity verification **cannot happen mid-phone-call** -- it must be done via the web UI (Streamlit) or direct API calls before or after the IVR enrollment.
+There are **two ways** to verify a citizen's MOSIP identity in VeriVoice:
 
-The practical pattern is: **verify identity on the web, then enroll via phone** (or vice versa, then link afterwards).
+1. **IVR DTMF OTP flow (in-call, recommended)** — the entire verification happens over the phone call using keypad input, via eSignet's server-driven OAuth endpoints. No browser needed.
+2. **Streamlit browser OIDC flow (out-of-band)** — citizen completes eSignet login in a browser, then links to an existing citizen record.
 
-### Scenario A: Verify First, Then Enroll via IVR
+### Scenario A: In-call DTMF verification (recommended)
 
-This is the recommended flow for a registration agent assisting a citizen in person. The agent verifies identity on a laptop/tablet, then the citizen enrolls their voice by calling the IVR.
+This is the most realistic user experience for a citizen calling in from a phone. No laptop, no browser, no SMS. Uses e-Signet's server-driven OAuth endpoints.
+
+**Step 1 — Start the stack**
+
+```bash
+# Terminal 1: eSignet Docker stack (if not already running)
+cd esignet/docker-compose
+docker compose up -d
+
+# Terminal 2: FastAPI backend
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 3: ngrok for Twilio webhooks
+ngrok http 8000
+```
+
+**Step 2 — Configure the Twilio Voice webhook** to `<ngrok-url>/twilio/voice/welcome` (see Section 6).
+
+**Step 3 — Call the IVR**
+
+1. Dial your Twilio number
+2. Press **1** (English) → you hear *"Press 1 to enroll. Press 2 to authenticate. Press 3 to verify your identity."*
+3. Press **3** (Verify)
+4. IVR: *"Please enter your national identity number followed by the pound key."* → enter your mock user's ID (`8267411571`) + `#`
+5. Backend calls eSignet `oauth-details` + `send-otp`
+6. IVR: *"An OTP has been sent. Please enter the six-digit OTP followed by the pound key."* → enter `111111` + `#` (mock OTP is always 111111)
+7. Backend calls eSignet `authenticate` + `auth-code` + `token`, validates id_token
+8. IVR: *"Your identity has been verified. Now we will enroll your voice."*
+9. Call redirects into enrollment with `national_id=8267411571` pre-filled — record 5 voice samples
+10. Enrollment completes; citizen row has `mosip_individual_id=<verified sub>` + `identity_verified=True`
+
+**Verify the citizen record:**
+
+```bash
+sqlite3 verivoice.db "SELECT national_id_number, mosip_individual_id, identity_verified FROM CITIZEN WHERE national_id_number = '8267411571';"
+```
+
+Expected output:
+```
+8267411571|s8-VG8_0sbZMmhKXB7qHS8L9yzlwTD2wvuY08p6kZsM|1
+```
+
+See `docs/ivr_verify_flow.md` for the detailed API call sequence.
+
+### Scenario B: Browser OIDC via Streamlit (out-of-band)
+
+#### Scenario B1: Verify on web first, then enroll via IVR
+
+This is useful when a registration agent assists a citizen in person. The agent verifies identity on a laptop/tablet, then the citizen enrolls their voice by calling the IVR.
 
 **Step 1 -- Start all services (4 terminals)**
 
@@ -836,7 +904,7 @@ curl http://localhost:8000/api/v1/mosip/link \
   -d '{"citizen_id": "<citizen-uuid>", "mosip_individual_id": "MOSIP-IND-12345"}'
 ```
 
-### Scenario B: Enroll via IVR First, Verify MOSIP Later
+#### Scenario B2: Enroll via IVR First, Verify MOSIP Later
 
 Useful when the registration agent doesn't have MOSIP access at the time of voice enrollment (e.g., field registration in a remote area). The citizen enrolls their voice over the phone, then visits a registration centre later to verify their MOSIP identity.
 
@@ -846,7 +914,7 @@ Useful when the registration agent doesn't have MOSIP access at the time of voic
    - Agent links the verified MOSIP ID to the citizen's existing record
 3. The citizen's record is upgraded from `identity_verified=False` to `identity_verified=True`
 
-### Scenario C: API-Only Testing (No Streamlit, No Phone)
+#### Scenario B3: API-Only Testing (No Streamlit, No Phone)
 
 Test the entire MOSIP + IVR chain via cURL without a browser or phone call.
 
