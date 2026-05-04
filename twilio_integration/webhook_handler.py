@@ -109,20 +109,64 @@ def _twiml_response(response: VoiceResponse) -> Response:
     return Response(content=str(response), media_type="application/xml")
 
 
-def _say_or_play(parent, text: str, lang: str) -> None:
+def _say_or_play(parent, text: str, lang: str, en_for_log: str | None = None) -> None:
     """Speak a prompt via the best TTS for the language.
 
     - English: Twilio <Say voice="alice"> (inline, zero latency)
     - Swahili: gTTS → MP3 file → <Play url> (proper Swahili pronunciation)
 
+    For testing: pass `en_for_log` (the English equivalent) and the log
+    line will show both languages side-by-side whenever a Swahili prompt
+    is played.
+
     Works with both VoiceResponse and Gather (both expose .say() and .play()).
     """
     if lang == "sw":
         url = _tts_service.synthesize_with_url(text, language="sw")
+        if en_for_log:
+            print(f"[IVR SW] {text}\n         [EN] {en_for_log}", flush=True)
+        else:
+            print(f"[IVR SW] {text}", flush=True)
         logger.debug("[IVR] <Play> Swahili: '%s...' → %s", text[:50], url)
         parent.play(url)
     else:
         parent.say(text, voice="alice", language="en-US")
+
+
+def _hold_audio(response, lang: str, duration_minutes: int = 5) -> None:
+    """Emit hold audio that repeats once every ~20 seconds for the given duration.
+
+    Strategy: alternate <Say>/<Play> with <Pause length="17"> so the caller
+    hears the reassurance message roughly every 20 seconds (3s speech + 17s
+    silence). This avoids irritating rapid repetition while keeping the call
+    alive for up to `duration_minutes` minutes.
+
+    For 5 minutes: 300s / 20s = 15 repetitions (30 TwiML verbs total).
+    """
+    repeat_count = (duration_minutes * 60) // 20  # one message every 20s
+    pause_seconds = 17  # ~3s speech + 17s silence = ~20s cycle
+
+    if lang == "sw":
+        msg = "Bado inachakatwa. Tafadhali subiri."
+        url = _tts_service.synthesize_with_url(msg, language="sw")
+        print(f"[IVR SW] <Play + Pause> {msg} (×{repeat_count}, ~{duration_minutes}min)", flush=True)
+        for _ in range(repeat_count):
+            response.play(url)
+            response.pause(length=pause_seconds)
+    else:
+        msg = "Still processing. Please hold."
+        print(f"[IVR EN] <Say + Pause> {msg} (×{repeat_count}, ~{duration_minutes}min)", flush=True)
+        for _ in range(repeat_count):
+            response.say(msg, voice="alice", language="en-US")
+            response.pause(length=pause_seconds)
+
+
+def _tr(en_text: str, sw_text: str, lang: str) -> str:
+    """Pick the prompt for the given language and log both when Swahili is played."""
+    if lang == "sw":
+        print(f"[IVR SW] {sw_text}\n         [EN] {en_text}", flush=True)
+        return sw_text
+    return en_text
 
 
 async def _validate_twilio_request(request: Request) -> None:
@@ -154,7 +198,7 @@ async def welcome(request: Request):
         num_digits=1,
         action="/twilio/voice/welcome/language",
         method="POST",
-        timeout=5,
+        timeout=30,
     )
     # Welcome is always in English — caller hasn't chosen a language yet
     gather.say(
@@ -163,7 +207,10 @@ async def welcome(request: Request):
         language="en-US",
     )
     response.append(gather)
-    response.say("No input received. Defaulting to English.", voice="alice")
+    # No language selected yet — say in both English and Swahili
+    response.say("No input received. Defaulting to English.", voice="alice", language="en-US")
+    url = _tts_service.synthesize_with_url("Haukuingiza kitu. Tunakamilisha kwa Kiingereza.", language="sw")
+    response.play(url)
     response.redirect("/twilio/voice/welcome/language?Digits=1", method="POST")
     return _twiml_response(response)
 
@@ -190,7 +237,7 @@ async def welcome_language(
         num_digits=1,
         action=f"/twilio/voice/welcome/action?lang={lang}",
         method="POST",
-        timeout=5,
+        timeout=30,
     )
     _say_or_play(gather, msg, lang)
     response.append(gather)
@@ -223,7 +270,7 @@ async def welcome_action(
         response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
     else:
         print(f"[IVR ACTION] >>> Invalid selection '{Digits}', restarting welcome", flush=True)
-        response.say("Invalid selection.", voice="alice")
+        _say_or_play(response, _tr("Invalid selection.", "Chaguo batili.", lang), lang)
         response.redirect("/twilio/voice/welcome", method="POST")
     return _twiml_response(response)
 
@@ -266,16 +313,24 @@ async def enroll_prompt(
             action=f"/twilio/voice/enroll?lang={lang}&step=1",
             method="POST",
             finish_on_key="#",
-            timeout=10,
+            timeout=30,
         )
         _say_or_play(
             gather,
-            "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #."
-            if lang == "sw"
-            else "Please enter your national ID number followed by the pound key.",
+            _tr("Please enter your national ID number followed by the pound key.", "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #.", lang),
             lang,
         )
         response.append(gather)
+        return _twiml_response(response)
+
+    # national_id already provided (redirect from auth or verify/otp) — skip
+    # the NID gather and jump to step 1 (first phrase recording)
+    if step == 0 and national_id:
+        print(f"[IVR ENROLL step=0] national_id={national_id} pre-filled — skipping to step=1", flush=True)
+        response.redirect(
+            f"/twilio/voice/enroll?lang={lang}&step=1&national_id={national_id}&session_id={session_id}",
+            method="POST",
+        )
         return _twiml_response(response)
 
     # Received national_id from previous gather (in Digits form field)
@@ -294,7 +349,7 @@ async def enroll_prompt(
         print(f"[IVR ENROLL COMPLETE] All {settings.ENROLLMENT_PHRASES} samples recorded for national_id={nid} (lang={lang})", flush=True)
         _say_or_play(
             response,
-            "Usajili umekamilika. Asante." if lang == "sw" else "Enrollment complete. Thank you.",
+            _tr("Enrollment complete. Thank you.", "Usajili umekamilika. Asante.", lang),
             lang,
         )
         response.hangup()
@@ -304,7 +359,7 @@ async def enroll_prompt(
     used = _enroll_phrases_used.setdefault(session_id, [])
     phrase = pick_random_enrollment_phrase(language=lang, exclude=used)
     used.append(phrase)
-    prompt_text = f"Tafadhali sema: {phrase}" if lang == "sw" else f"Please say: {phrase}"
+    prompt_text = _tr(f"Please say: {phrase}", f"Tafadhali sema: {phrase}", lang)
 
     print(f"[IVR ENROLL step={step}/{settings.ENROLLMENT_PHRASES}] >>> Playing: '{prompt_text}' (nid={nid}, lang={lang})", flush=True)
     print(f"[IVR ENROLL step={step}] Waiting for user to speak and record...", flush=True)
@@ -312,7 +367,7 @@ async def enroll_prompt(
     _say_or_play(response, prompt_text, lang)
     _say_or_play(
         response,
-        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        _tr("Press pound when you are done.", "Bonyeza # ukimaliza.", lang),
         lang,
     )
     response.record(
@@ -321,7 +376,7 @@ async def enroll_prompt(
         method="POST",
         play_beep=True,
         trim="trim-silence",
-        timeout=0,
+        timeout=5,
         finish_on_key="#",
     )
     return _twiml_response(response)
@@ -351,8 +406,7 @@ async def _run_enrollment_pipeline(job_id: str, recording_urls: list[str],
             if existing:
                 print(f"[ENROLL BG {job_id}] ERROR: National ID {national_id} already enrolled", flush=True)
                 await _update_call_twiml(call_sid, _build_result_twiml(
-                    "Nambari hii ya kitambulisho tayari imesajiliwa." if lang == "sw"
-                    else "This national ID is already enrolled."))
+                    _tr("This national ID is already enrolled.", "Nambari hii ya kitambulisho tayari imesajiliwa.", lang)))
                 return
 
             embedding_service = EmbeddingService()
@@ -414,8 +468,7 @@ async def _run_enrollment_pipeline(job_id: str, recording_urls: list[str],
 
             # Instantly redirect the live call to announce success
             await _update_call_twiml(call_sid, _build_result_twiml(
-                "Usajili umekamilika. Asante." if lang == "sw"
-                else "Enrollment complete. Thank you."))
+                _tr("Enrollment complete. Thank you.", "Usajili umekamilika. Asante.", lang)))
 
         finally:
             db.close()
@@ -424,8 +477,7 @@ async def _run_enrollment_pipeline(job_id: str, recording_urls: list[str],
         print(f"[ENROLL BG {job_id}] ERROR: {e}", flush=True)
         try:
             await _update_call_twiml(call_sid, _build_result_twiml(
-                "Hitilafu imetokea wakati wa kusajili. Tafadhali jaribu tena." if lang == "sw"
-                else "An error occurred during enrollment. Please try again."))
+                _tr("An error occurred during enrollment. Please try again.", "Hitilafu imetokea wakati wa kusajili. Tafadhali jaribu tena.", lang)))
         except Exception:
             pass  # Call may already be gone
 
@@ -475,8 +527,7 @@ async def enroll_callback(
     if len(all_recordings) < settings.ENROLLMENT_PHRASES:
         print(f"[IVR ENROLL CALLBACK] ERROR: Only {len(all_recordings)} recordings, need {settings.ENROLLMENT_PHRASES}", flush=True)
         _say_or_play(response,
-                     "Hitilafu imetokea. Tafadhali jaribu tena." if lang == "sw"
-                     else "An error occurred. Not enough recordings. Please try again.", lang)
+                     _tr("An error occurred. Not enough recordings. Please try again.", "Hitilafu imetokea. Tafadhali jaribu tena.", lang), lang)
         response.hangup()
         return _twiml_response(response)
 
@@ -485,23 +536,17 @@ async def enroll_callback(
     asyncio.create_task(_run_enrollment_pipeline(
         job_id, all_recordings, national_id, lang, CallSid))
 
-    # Play long hold audio — background task will interrupt this via REST API
+    # Play long hold audio — background task will interrupt this via REST API.
+    # Single Play/Say verb with loop=N keeps the call alive reliably.
     _say_or_play(
         response,
-        "Sauti zako zinachakatwa. Tafadhali subiri."
-        if lang == "sw"
-        else "Processing your voice samples. Please wait.",
+        _tr("Processing your voice samples. Please wait.", "Sauti zako zinachakatwa. Tafadhali subiri.", lang),
         lang,
     )
-    wait_msg = ("Bado inachakatwa. Tafadhali subiri."
-                if lang == "sw" else "Still processing. Please hold.")
-    for _ in range(30):  # ~3 minutes of hold audio (will be interrupted when done)
-        response.pause(length=4)
-        _say_or_play(response, wait_msg, lang)
+    _hold_audio(response, lang, duration_minutes=5)
     # Fallback if REST API update somehow fails
     _say_or_play(response,
-                 "Tafadhali jaribu tena baadaye." if lang == "sw"
-                 else "Please try again later.", lang)
+                 _tr("Please try again later.", "Tafadhali jaribu tena baadaye.", lang), lang)
     response.hangup()
     return _twiml_response(response)
 
@@ -538,16 +583,14 @@ async def authenticate_prompt(
             )
             _say_or_play(
                 gather,
-                "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #."
-                if lang == "sw"
-                else "Please enter your national ID number followed by the pound key.",
+                _tr("Please enter your national ID number followed by the pound key.", "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #.", lang),
                 lang,
             )
             response.append(gather)
             # No input after timeout — retry once
             _say_or_play(
                 response,
-                "Hukuingiza nambari yoyote." if lang == "sw" else "No number entered.",
+                _tr("No number entered.", "Hukuingiza nambari yoyote.", lang),
                 lang,
             )
             response.redirect(
@@ -566,9 +609,7 @@ async def authenticate_prompt(
         print(f"[IVR AUTH] Citizen not found for national_id={national_id} — redirecting to enroll", flush=True)
         _say_or_play(
             response,
-            "Nambari hiyo haijasajiliwa. Tafadhali sajili kwanza."
-            if lang == "sw"
-            else "That national ID is not enrolled. Please enroll first.",
+            _tr("That national ID is not enrolled. Please enroll first.", "Nambari hiyo haijasajiliwa. Tafadhali sajili kwanza.", lang),
             lang,
         )
         response.redirect(
@@ -587,12 +628,12 @@ async def authenticate_prompt(
 
     _say_or_play(
         response,
-        f"Tafadhali sema: {phrase}" if lang == "sw" else f"Please say the following phrase: {phrase}",
+        _tr(f"Please say the following phrase: {phrase}", f"Tafadhali sema: {phrase}", lang),
         lang,
     )
     _say_or_play(
         response,
-        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        _tr("Press pound when you are done.", "Bonyeza # ukimaliza.", lang),
         lang,
     )
 
@@ -605,7 +646,7 @@ async def authenticate_prompt(
         method="POST",
         play_beep=True,
         trim="trim-silence",
-        timeout=0,
+        timeout=5,
         finish_on_key="#",
     )
     return _twiml_response(response)
@@ -634,16 +675,14 @@ async def _run_auth_pipeline(job_id: str, recording_url: str, national_id: str,
             if citizen is None:
                 print(f"[AUTH BG {job_id}] ERROR: Citizen not found for national_id={national_id}", flush=True)
                 await _update_call_twiml(call_sid, _build_twiml(
-                    "Raia hajapatikana. Tafadhali jisajili kwanza." if lang == "sw"
-                    else "Citizen not found. Please enroll first."))
+                    _tr("Citizen not found. Please enroll first.", "Raia hajapatikana. Tafadhali jisajili kwanza.", lang)))
                 return
 
             template = get_active_template(db, citizen.citizen_id)
             if template is None:
                 print(f"[AUTH BG {job_id}] ERROR: No active voice template", flush=True)
                 await _update_call_twiml(call_sid, _build_twiml(
-                    "Hakuna kiolezo cha sauti. Tafadhali jisajili kwanza." if lang == "sw"
-                    else "No voice template found. Please enroll first."))
+                    _tr("No voice template found. Please enroll first.", "Hakuna kiolezo cha sauti. Tafadhali jisajili kwanza.", lang)))
                 return
 
             print(f"[AUTH BG {job_id}] Downloading recording from Twilio...", flush=True)
@@ -704,16 +743,16 @@ async def _run_auth_pipeline(job_id: str, recording_url: str, national_id: str,
             if granted:
                 _say_or_play(
                     result_response,
-                    f"Imethibitishwa. Alama ya sauti ni asilimia {int(voice_score * 100)}."
-                    if lang == "sw"
-                    else f"Access granted. Your voice score is {voice_score:.2f}.",
+                    _tr(
+                        f"Access granted. Your voice score is {voice_score:.2f}.",
+                        f"Imethibitishwa. Alama ya sauti ni asilimia {int(voice_score * 100)}.",
+                        lang,
+                    ),
                     lang,
                 )
                 _say_or_play(
                     result_response,
-                    "Huduma zinazopatikana: Fomu ya Bima ya Afya. Utaelekezwa kwenye idhini."
-                    if lang == "sw"
-                    else "Available services: Health Insurance Form. You will now be directed to consent.",
+                    _tr("You will now be directed to consent before accessing services.", "Utaelekezwa kwenye idhini kabla ya kupata huduma.", lang),
                     lang,
                 )
                 base = settings.PUBLIC_BASE_URL.rstrip("/")
@@ -724,9 +763,11 @@ async def _run_auth_pipeline(job_id: str, recording_url: str, national_id: str,
             elif attempt < 1:
                 _say_or_play(
                     result_response,
-                    f"Imekataliwa. Alama ya sauti ni asilimia {int(voice_score * 100)}. Tafadhali jaribu tena."
-                    if lang == "sw"
-                    else f"Access denied. Your voice score is {voice_score:.2f}. Please try again.",
+                    _tr(
+                        f"Access denied. Your voice score is {voice_score:.2f}. Please try again.",
+                        f"Imekataliwa. Alama ya sauti ni asilimia {int(voice_score * 100)}. Tafadhali jaribu tena.",
+                        lang,
+                    ),
                     lang,
                 )
                 base = settings.PUBLIC_BASE_URL.rstrip("/")
@@ -737,9 +778,7 @@ async def _run_auth_pipeline(job_id: str, recording_url: str, national_id: str,
             else:
                 _say_or_play(
                     result_response,
-                    "Imekataliwa tena. Tafadhali jaribu tena baadaye. Kwaheri."
-                    if lang == "sw"
-                    else "Access denied again. Please try again later. Goodbye.",
+                    _tr("Access denied again. Please try again later. Goodbye.", "Imekataliwa tena. Tafadhali jaribu tena baadaye. Kwaheri.", lang),
                     lang,
                 )
                 result_response.hangup()
@@ -753,8 +792,7 @@ async def _run_auth_pipeline(job_id: str, recording_url: str, national_id: str,
         print(f"[AUTH BG {job_id}] ERROR: {e}", flush=True)
         try:
             await _update_call_twiml(call_sid, _build_twiml(
-                "Hitilafu imetokea. Tafadhali jaribu tena." if lang == "sw"
-                else "An error occurred. Please try again later."))
+                _tr("An error occurred. Please try again later.", "Hitilafu imetokea. Tafadhali jaribu tena.", lang)))
         except Exception:
             pass
 
@@ -795,23 +833,17 @@ async def authenticate_callback(
         job_id, RecordingUrl, national_id, challenge_id, lang, attempt, CallSid
     ))
 
-    # Play long hold audio — background task will interrupt this via REST API
+    # Play long hold audio — background task will interrupt this via REST API.
+    # Single Play/Say verb with loop=N keeps the call alive reliably.
     _say_or_play(
         response,
-        "Sauti yako inachakatwa. Tafadhali subiri."
-        if lang == "sw"
-        else "Your voice is being processed. Please wait.",
+        _tr("Your voice is being processed. Please wait.", "Sauti yako inachakatwa. Tafadhali subiri.", lang),
         lang,
     )
-    wait_msg = ("Bado inachakatwa. Tafadhali subiri."
-                if lang == "sw" else "Still processing. Please hold.")
-    for _ in range(30):  # ~3 minutes of hold audio (will be interrupted when done)
-        response.pause(length=4)
-        _say_or_play(response, wait_msg, lang)
+    _hold_audio(response, lang, duration_minutes=5)
     # Fallback if REST API update somehow fails
     _say_or_play(response,
-                 "Tafadhali jaribu tena baadaye." if lang == "sw"
-                 else "Please try again later.", lang)
+                 _tr("Please try again later.", "Tafadhali jaribu tena baadaye.", lang), lang)
     response.hangup()
     return _twiml_response(response)
 
@@ -820,8 +852,8 @@ async def authenticate_callback(
 # CONSENT
 # ═════════════════════════════════════════════════════════════════════════════
 
-_CONSENT_MINISTRY_CODE = "MOH"
-_CONSENT_DATA_SCOPE = "health_records"
+_CONSENT_MINISTRY_CODE = "GOV"
+_CONSENT_DATA_SCOPE = "service_access"
 
 
 @router.post("/voice/consent")
@@ -848,27 +880,24 @@ async def consent_prompt(
     if citizen is None:
         print(f"[IVR CONSENT] ERROR: Invalid citizen_id={citizen_id}", flush=True)
         _say_or_play(response,
-                     "Kikao hakipatikani. Kwaheri." if lang == "sw"
-                     else "Session not found. Goodbye.", lang)
+                     _tr("Session not found. Goodbye.", "Kikao hakipatikani. Kwaheri.", lang), lang)
         response.hangup()
         return _twiml_response(response)
 
     if unclear_attempt > 0:
-        clarify = ("Sikusikia vizuri. Tafadhali sema Ndiyo au Hapana."
-                   if lang == "sw"
-                   else "I didn't catch that. Please say Yes or No.")
+        clarify = (_tr("I didn't catch that. Please say Yes or No.", "Sikusikia vizuri. Tafadhali sema Ndiyo au Hapana.", lang))
         _say_or_play(response, clarify, lang)
 
     if lang == "sw":
-        consent_text = "Ninakubali kushiriki rekodi zangu za afya na Wizara ya Afya. Sema Ndiyo kukubali au Hapana kukataa."
+        consent_text = "Ninakubali kushiriki taarifa zangu binafsi na huduma za serikali na fedha zilizothibitishwa kupitia VeriVoice. Sema Ndiyo kukubali au Hapana kukataa."
     else:
-        consent_text = "I consent to share my health records with the Ministry of Health. Say Yes to agree or No to decline."
+        consent_text = "I consent to share my personal information with verified government and financial services through VeriVoice. Say Yes to agree or No to decline."
 
     print(f"[IVR CONSENT] >>> Playing: '{consent_text}' (lang={lang}, citizen_id={citizen_id}, attempt={unclear_attempt})", flush=True)
     _say_or_play(response, consent_text, lang)
     _say_or_play(
         response,
-        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.",
+        _tr("Press pound when you are done.", "Bonyeza # ukimaliza.", lang),
         lang,
     )
     response.record(
@@ -878,7 +907,7 @@ async def consent_prompt(
         method="POST",
         play_beep=True,
         trim="trim-silence",
-        timeout=0,
+        timeout=5,
         finish_on_key="#",
     )
     return _twiml_response(response)
@@ -945,9 +974,7 @@ async def _run_consent_pipeline(
 
             def _granted(r: VoiceResponse):
                 _say_or_play(r,
-                    "Idhini imerekodiwa. Utaelekezwa kwenye fomu."
-                    if lang == "sw"
-                    else "Consent recorded. You will now be directed to the form.",
+                    _tr("Consent recorded. You will now choose a service.", "Idhini imerekodiwa. Sasa utachagua huduma.", lang),
                     lang)
                 r.redirect(
                     f"{base}/twilio/voice/service/menu?lang={lang}"
@@ -960,9 +987,7 @@ async def _run_consent_pipeline(
         if intent == "no":
             def _denied(r: VoiceResponse):
                 _say_or_play(r,
-                    "Idhini imekataliwa. Kwaheri."
-                    if lang == "sw"
-                    else "Consent declined. Goodbye.",
+                    _tr("Consent declined. Goodbye.", "Idhini imekataliwa. Kwaheri.", lang),
                     lang)
                 r.hangup()
             await _update_call_twiml(call_sid, _build_twiml_with(_denied))
@@ -981,9 +1006,7 @@ async def _run_consent_pipeline(
 
         def _give_up(r: VoiceResponse):
             _say_or_play(r,
-                "Sikuweza kuelewa. Tafadhali jaribu tena baadaye. Kwaheri."
-                if lang == "sw"
-                else "I could not understand. Please try again later. Goodbye.",
+                _tr("I could not understand. Please try again later. Goodbye.", "Sikuweza kuelewa. Tafadhali jaribu tena baadaye. Kwaheri.", lang),
                 lang)
             r.hangup()
         await _update_call_twiml(call_sid, _build_twiml_with(_give_up))
@@ -993,9 +1016,7 @@ async def _run_consent_pipeline(
         try:
             def _err(r: VoiceResponse):
                 _say_or_play(r,
-                    "Hitilafu imetokea. Tafadhali jaribu tena baadaye."
-                    if lang == "sw"
-                    else "An error occurred. Please try again later.",
+                    _tr("An error occurred. Please try again later.", "Hitilafu imetokea. Tafadhali jaribu tena baadaye.", lang),
                     lang)
                 r.hangup()
             await _update_call_twiml(call_sid, _build_twiml_with(_err))
@@ -1033,15 +1054,10 @@ async def consent_callback(
     # Hold audio until background task interrupts via REST API
     _say_or_play(
         response,
-        "Idhini yako inachakatwa. Tafadhali subiri."
-        if lang == "sw"
-        else "Processing your consent. Please hold.",
+        _tr("Processing your consent. Please hold.", "Idhini yako inachakatwa. Tafadhali subiri.", lang),
         lang,
     )
-    wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(40):  # ~3 min hold until background pipeline interrupts
-        response.pause(length=3)
-        _say_or_play(response, wait_msg, lang)
+    _hold_audio(response, lang, duration_minutes=5)
     response.hangup()
     return _twiml_response(response)
 
@@ -1085,8 +1101,7 @@ async def service_menu(
         if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id):
             print(f"[IVR SERVICE MENU] ERROR: invalid consent token {consent_token_id}", flush=True)
             _say_or_play(response,
-                "Idhini si halali. Kwaheri." if lang == "sw"
-                else "Consent is not valid. Goodbye.", lang)
+                _tr("Consent is not valid. Goodbye.", "Idhini si halali. Kwaheri.", lang), lang)
             response.hangup()
             return _twiml_response(response)
     finally:
@@ -1106,7 +1121,7 @@ async def service_menu(
             return _twiml_response(response)
         # Invalid digit — fall through to re-prompt
         _say_or_play(response,
-            "Chaguo batili." if lang == "sw" else "Invalid selection.", lang)
+            _tr("Invalid selection.", "Chaguo batili.", lang), lang)
 
     print(f"[IVR SERVICE MENU] >>> Playing menu (lang={lang})", flush=True)
     gather = Gather(
@@ -1114,7 +1129,7 @@ async def service_menu(
         action=(f"/twilio/voice/service/menu?lang={lang}"
                 f"&citizen_id={citizen_id}&consent_token_id={consent_token_id}"),
         method="POST",
-        timeout=10,
+        timeout=30,
     )
     _say_or_play(gather, menu_prompt(lang), lang)
     response.append(gather)
@@ -1173,8 +1188,7 @@ async def service_prompt(
         if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id):
             print(f"[IVR SERVICE] ERROR: invalid consent token {consent_token_id}", flush=True)
             _say_or_play(response,
-                "Idhini si halali. Kwaheri." if lang == "sw"
-                else "Consent is not valid. Goodbye.", lang)
+                _tr("Consent is not valid. Goodbye.", "Idhini si halali. Kwaheri.", lang), lang)
             response.hangup()
             return _twiml_response(response)
     finally:
@@ -1184,8 +1198,7 @@ async def service_prompt(
     if svc is None:
         print(f"[IVR SERVICE] ERROR: unknown service_code={service_code}", flush=True)
         _say_or_play(response,
-            "Huduma haijulikani. Kwaheri." if lang == "sw"
-            else "Unknown service. Goodbye.", lang)
+            _tr("Unknown service. Goodbye.", "Huduma haijulikani. Kwaheri.", lang), lang)
         response.hangup()
         return _twiml_response(response)
 
@@ -1196,15 +1209,13 @@ async def service_prompt(
         print(f"[IVR SERVICE READBACK] service={service_code} q0={q0!r} q1={q1!r} q2={q2!r} (correction={correction_attempts}, unclear={unclear_attempt})", flush=True)
         if unclear_attempt > 0:
             _say_or_play(response,
-                "Sikusikia vizuri. Tafadhali sema Ndiyo au Hapana."
-                if lang == "sw"
-                else "I didn't catch that. Please say Yes or No.", lang)
+                _tr("I didn't catch that. Please say Yes or No.", "Sikusikia vizuri. Tafadhali sema Ndiyo au Hapana.", lang), lang)
 
         summary = _readback_for(service_code, lang, q0, q1, q2)
         print(f"[IVR SERVICE READBACK] >>> {summary}", flush=True)
         _say_or_play(response, summary, lang)
         _say_or_play(response,
-            "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.", lang)
+            _tr("Press pound when you are done.", "Bonyeza # ukimaliza.", lang), lang)
         response.record(
             max_length=5,
             action=(
@@ -1217,7 +1228,7 @@ async def service_prompt(
             method="POST",
             play_beep=True,
             trim="trim-silence",
-            timeout=0,
+            timeout=5,
             finish_on_key="#",
         )
         return _twiml_response(response)
@@ -1227,7 +1238,7 @@ async def service_prompt(
     print(f"[IVR SERVICE Q{question_index+1}/{len(questions)}] service={service_code} >>> {q_text}", flush=True)
     _say_or_play(response, q_text, lang)
     _say_or_play(response,
-        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.", lang)
+        _tr("Press pound when you are done.", "Bonyeza # ukimaliza.", lang), lang)
     response.record(
         max_length=15,
         action=(
@@ -1241,7 +1252,7 @@ async def service_prompt(
         method="POST",
         play_beep=True,
         trim="trim-silence",
-        timeout=0,
+        timeout=5,
         finish_on_key="#",
     )
     return _twiml_response(response)
@@ -1356,11 +1367,8 @@ async def service_callback(
     ))
 
     _say_or_play(response,
-        "Jibu lako linachakatwa." if lang == "sw" else "Processing your answer.", lang)
-    wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(40):  # ~3 min hold until background pipeline interrupts
-        response.pause(length=3)
-        _say_or_play(response, wait_msg, lang)
+        _tr("Processing your answer.", "Jibu lako linachakatwa.", lang), lang)
+    _hold_audio(response, lang, duration_minutes=5)
     response.hangup()
     return _twiml_response(response)
 
@@ -1434,9 +1442,7 @@ async def _run_service_confirm_pipeline(
             if correction_attempts >= 3:
                 def _give_up(r: VoiceResponse):
                     _say_or_play(r,
-                        "Imeshindikana kukamilisha. Tafadhali jaribu tena baadaye. Kwaheri."
-                        if lang == "sw"
-                        else "Unable to complete the request. Please try again later. Goodbye.", lang)
+                        _tr("Unable to complete the request. Please try again later. Goodbye.", "Imeshindikana kukamilisha. Tafadhali jaribu tena baadaye. Kwaheri.", lang), lang)
                     r.hangup()
                 await _update_call_twiml(call_sid, _build(_give_up))
                 return
@@ -1468,9 +1474,7 @@ async def _run_service_confirm_pipeline(
 
         def _give_up(r: VoiceResponse):
             _say_or_play(r,
-                "Sikuweza kuthibitisha. Tafadhali jaribu tena baadaye. Kwaheri."
-                if lang == "sw"
-                else "Unable to confirm. Please try again later. Goodbye.", lang)
+                _tr("Unable to confirm. Please try again later. Goodbye.", "Sikuweza kuthibitisha. Tafadhali jaribu tena baadaye. Kwaheri.", lang), lang)
             r.hangup()
         await _update_call_twiml(call_sid, _build(_give_up))
 
@@ -1479,9 +1483,7 @@ async def _run_service_confirm_pipeline(
         try:
             def _err(r: VoiceResponse):
                 _say_or_play(r,
-                    "Hitilafu imetokea. Tafadhali jaribu tena baadaye."
-                    if lang == "sw"
-                    else "An error occurred. Please try again later.", lang)
+                    _tr("An error occurred. Please try again later.", "Hitilafu imetokea. Tafadhali jaribu tena baadaye.", lang), lang)
                 r.hangup()
             await _update_call_twiml(call_sid, _build(_err))
         except Exception:
@@ -1527,11 +1529,8 @@ async def service_confirm(
     ))
 
     _say_or_play(response,
-        "Uthibitisho unachakatwa." if lang == "sw" else "Processing your confirmation.", lang)
-    wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(40):
-        response.pause(length=3)
-        _say_or_play(response, wait_msg, lang)
+        _tr("Processing your confirmation.", "Uthibitisho unachakatwa.", lang), lang)
+    _hold_audio(response, lang, duration_minutes=5)
     response.hangup()
     return _twiml_response(response)
 
@@ -1558,17 +1557,13 @@ async def service_correct(
 
     if unclear_attempt > 0:
         _say_or_play(response,
-            "Sikusikia vizuri. Tafadhali sema Moja, Mbili, au Tatu."
-            if lang == "sw"
-            else "I didn't catch that. Please say One, Two, or Three.", lang)
+            _tr("I didn't catch that. Please say One, Two, or Three.", "Sikusikia vizuri. Tafadhali sema Moja, Mbili, au Tatu.", lang), lang)
 
-    prompt = ("Ni swali lipi ungependa kubadilisha? Tafadhali sema Moja, Mbili, au Tatu."
-              if lang == "sw"
-              else "Which question would you like to change? Please say One, Two, or Three.")
+    prompt = (_tr("Which question would you like to change? Please say One, Two, or Three.", "Ni swali lipi ungependa kubadilisha? Tafadhali sema Moja, Mbili, au Tatu.", lang))
     print(f"[IVR SERVICE CORRECT] >>> {prompt} (attempt={correction_attempts}, unclear={unclear_attempt})", flush=True)
     _say_or_play(response, prompt, lang)
     _say_or_play(response,
-        "Bonyeza # ukimaliza." if lang == "sw" else "Press pound when you are done.", lang)
+        _tr("Press pound when you are done.", "Bonyeza # ukimaliza.", lang), lang)
     response.record(
         max_length=5,
         action=(
@@ -1581,7 +1576,7 @@ async def service_correct(
         method="POST",
         play_beep=True,
         trim="trim-silence",
-        timeout=0,
+        timeout=5,
         finish_on_key="#",
     )
     return _twiml_response(response)
@@ -1630,9 +1625,7 @@ async def _run_service_correct_pipeline(
 
             def _give_up(r: VoiceResponse):
                 _say_or_play(r,
-                    "Sikuweza kuelewa. Tafadhali jaribu tena baadaye. Kwaheri."
-                    if lang == "sw"
-                    else "I could not understand. Please try again later. Goodbye.", lang)
+                    _tr("I could not understand. Please try again later. Goodbye.", "Sikuweza kuelewa. Tafadhali jaribu tena baadaye. Kwaheri.", lang), lang)
                 r.hangup()
             await _update_call_twiml(call_sid, _build(_give_up))
             return
@@ -1655,9 +1648,7 @@ async def _run_service_correct_pipeline(
         try:
             def _err(r: VoiceResponse):
                 _say_or_play(r,
-                    "Hitilafu imetokea. Tafadhali jaribu tena baadaye."
-                    if lang == "sw"
-                    else "An error occurred. Please try again later.", lang)
+                    _tr("An error occurred. Please try again later.", "Hitilafu imetokea. Tafadhali jaribu tena baadaye.", lang), lang)
                 r.hangup()
             await _update_call_twiml(call_sid, _build(_err))
         except Exception:
@@ -1701,11 +1692,8 @@ async def service_correct_callback(
     ))
 
     _say_or_play(response,
-        "Jibu linachakatwa." if lang == "sw" else "Processing your response.", lang)
-    wait_msg = ("Tafadhali subiri." if lang == "sw" else "Please hold.")
-    for _ in range(20):  # ~1 min — number classification is quick
-        response.pause(length=3)
-        _say_or_play(response, wait_msg, lang)
+        _tr("Processing your response.", "Jibu linachakatwa.", lang), lang)
+    _hold_audio(response, lang, duration_minutes=3)  # quick task
     response.hangup()
     return _twiml_response(response)
 
@@ -1747,12 +1735,10 @@ async def verify_start(
         action=f"/twilio/voice/verify/nid?lang={lang}",
         method="POST",
         finish_on_key="#",
-        timeout=10,
+        timeout=30,
     )
     prompt = (
-        "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #."
-        if lang == "sw"
-        else "Please enter your national identity number followed by the pound key."
+        _tr("Please enter your national identity number followed by the pound key.", "Tafadhali ingiza nambari yako ya kitambulisho kisha bonyeza #.", lang)
     )
     _say_or_play(gather, prompt, lang)
     response.append(gather)
@@ -1777,7 +1763,7 @@ async def verify_nid(
     if not national_id:
         _say_or_play(
             response,
-            "Hukuingiza nambari yoyote." if lang == "sw" else "No number entered.",
+            _tr("No number entered.", "Hukuingiza nambari yoyote.", lang),
             lang,
         )
         response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
@@ -1790,8 +1776,7 @@ async def verify_nid(
         print(f"[IVR VERIFY NID] eSignet start_otp_auth failed: {exc}", flush=True)
         _say_or_play(
             response,
-            "Nambari ya kitambulisho haijatambuliwa. Tafadhali jaribu tena." if lang == "sw"
-            else "That identity could not be verified. Please try again.",
+            _tr("That identity could not be verified. Please try again.", "Nambari ya kitambulisho haijatambuliwa. Tafadhali jaribu tena.", lang),
             lang,
         )
         response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
@@ -1815,17 +1800,14 @@ async def verify_nid(
     )
     _say_or_play(
         gather,
-        "OTP imetumwa. Tafadhali ingiza OTP yenye tarakimu sita kisha bonyeza #."
-        if lang == "sw"
-        else "An OTP has been sent. Please enter the six-digit OTP followed by the pound key.",
+        _tr("An OTP has been sent. Please enter the six-digit OTP followed by the pound key.", "OTP imetumwa. Tafadhali ingiza OTP yenye tarakimu sita kisha bonyeza #.", lang),
         lang,
     )
     response.append(gather)
     # Timeout fallback
     _say_or_play(
         response,
-        "Hukuingiza OTP. Tafadhali piga simu tena." if lang == "sw"
-        else "No OTP entered. Please call again.",
+        _tr("No OTP entered. Please call again.", "Hukuingiza OTP. Tafadhali piga simu tena.", lang),
         lang,
     )
     response.hangup()
@@ -1850,8 +1832,7 @@ async def verify_otp(
     if not raw:
         _say_or_play(
             response,
-            "Kipindi kimeisha. Tafadhali anza upya." if lang == "sw"
-            else "Session expired. Please start again.",
+            _tr("Session expired. Please start again.", "Kipindi kimeisha. Tafadhali anza upya.", lang),
             lang,
         )
         response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
@@ -1863,7 +1844,7 @@ async def verify_otp(
     if not otp:
         _say_or_play(
             response,
-            "Hukuingiza OTP." if lang == "sw" else "No OTP entered.",
+            _tr("No OTP entered.", "Hukuingiza OTP.", lang),
             lang,
         )
         response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
@@ -1877,8 +1858,7 @@ async def verify_otp(
         print(f"[IVR VERIFY OTP] verification failed: {exc}", flush=True)
         _say_or_play(
             response,
-            "OTP si sahihi. Tafadhali jaribu tena." if lang == "sw"
-            else "OTP is incorrect. Please try again.",
+            _tr("OTP is incorrect. Please try again.", "OTP si sahihi. Tafadhali jaribu tena.", lang),
             lang,
         )
         response.redirect(f"/twilio/voice/verify/start?lang={lang}", method="POST")
@@ -1897,9 +1877,7 @@ async def verify_otp(
 
     _say_or_play(
         response,
-        "Kitambulisho chako kimethibitishwa. Sasa tutasajili sauti yako."
-        if lang == "sw"
-        else "Your identity has been verified. Now we will enroll your voice.",
+        _tr("Your identity has been verified. Now we will enroll your voice.", "Kitambulisho chako kimethibitishwa. Sasa tutasajili sauti yako.", lang),
         lang,
     )
     # Jump into the enrollment flow with the verified national_id pre-filled

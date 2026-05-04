@@ -17,6 +17,7 @@ This guide covers how to set up, configure, and use the VeriVoice Interactive Vo
 9. [Complete User Journey — End-to-End Example](#9-complete-user-journey--end-to-end-example)
    - [Phase 1: Welcome and Language Selection](#phase-1-welcome-and-language-selection)
    - [Phase 2: Enrollment (First-time User)](#phase-2-enrollment-first-time-user)
+   - [Phase 2b: Identity-Verified Enrollment via eSignet (Press 3)](#phase-2b-identity-verified-enrollment-via-esignet-press-3)
    - [Phase 3: Authentication (Returning User)](#phase-3-authentication-returning-user)
    - [Phase 4: Consent](#phase-4-consent)
    - [Phase 5: Service Access (5-service catalog)](#phase-5-service-access--5-service-catalog-same-call-after-consent)
@@ -227,20 +228,23 @@ Server returns <Say> + <Record> TwiML
 3. Caller speaks their answer
     |  "Amina Juma Ochieng"
     v
-4. Recording ENDS when the caller presses # on the keypad:
+4. Recording ENDS when any of these conditions is met:
     |
     |── (a) KEYPRESS — # (primary method)
     |       The caller presses # on their phone keypad
     |       to signal "I'm done speaking." This gives the
     |       caller explicit control over when recording stops.
-    |       Silence detection is DISABLED (timeout=0) so the
-    |       recording will NOT auto-stop on pauses.
     |
-    |── (b) MAX LENGTH HIT (safety fallback)
+    |── (b) SILENCE TIMEOUT — 5 seconds of silence (auto-stop)
+    |       If the caller stops speaking for 5 seconds without
+    |       pressing #, Twilio automatically ends the recording.
+    |       This prevents the call from hanging if the caller
+    |       forgets to press #.
+    |
+    |── (c) MAX LENGTH HIT (safety fallback)
     |       The recording hard-stops at maxLength seconds
     |       (15s for form answers, 10s for enrollment, 5s for
-    |       confirmation). Prevents runaway recordings if the
-    |       caller forgets to press #.
+    |       confirmation). Prevents runaway recordings.
     |
     v
 5. trim="trim-silence" strips leading/trailing silence
@@ -260,9 +264,9 @@ The caller simply:
 2. **Hears "Press pound when you are done"**
 3. **Hears a beep** — recording starts
 4. **Speaks their answer**
-5. **Presses # on the keypad** — recording stops and is submitted
+5. **Presses # on the keypad** — OR waits 5 seconds of silence — recording stops and is submitted
 
-Silence detection is disabled (`timeout=0`) so the caller can pause, think, or take their time without the recording cutting out mid-sentence. This is important for names, addresses, and facility names where callers may pause between words. The `#` keypress gives the caller explicit, predictable control.
+A 5-second silence timeout automatically ends the recording if the caller forgets to press `#`. This is long enough for natural pauses between words (names, addresses) but short enough to prevent the call from hanging indefinitely.
 
 ### Recording parameters we use
 
@@ -272,7 +276,7 @@ Silence detection is disabled (`timeout=0`) so the caller can pause, think, or t
 | `playBeep` | `true` | Clear audio cue that the system is listening |
 | `trim` | `trim-silence` | Removes silence padding so Whisper gets clean audio |
 | `finishOnKey` | `#` | Caller presses # to stop recording (primary stop method) |
-| `timeout` | `0` (disabled) | Silence detection is OFF — recording only stops on # or maxLength |
+| `timeout` | `5` seconds | Auto-stops recording after 5s of silence if caller doesn't press # |
 
 ### Important: RecordingUrl authentication
 
@@ -309,7 +313,7 @@ The system plays:
 
 Amina presses **1** on her phone keypad.
 
-If no input is received within 5 seconds, the system defaults to English.
+If no input is received within 30 seconds, the system defaults to English.
 
 **Step 2 — Language confirmed, action selection**
 
@@ -392,6 +396,116 @@ The call ends (hangup).
 4. The centroid is encrypted with **Paillier homomorphic encryption** (2048-bit)
 5. The plaintext centroid is zeroed from memory
 6. The encrypted ciphertext is stored in the `VOICE_TEMPLATE` table linked to Amina's `CITIZEN` record
+
+---
+
+### Phase 2b: Identity-Verified Enrollment via eSignet (Press 3)
+
+Instead of enrolling directly with just a national ID (Press 1, Phase 2), the caller can press **3** at the action menu to first verify their identity against MOSIP via eSignet. The entire verification happens **on the phone call** using DTMF — no SMS, no browser, no public URL exposure for eSignet. After successful verification, the call falls through into the same Phase 2 enrollment flow, but the resulting `CITIZEN` row gets linked to the verified MOSIP `individual_id` and `identity_verified=True` is set automatically.
+
+Use this path when you want a **MOSIP-verified** voice enrollment. The voice biometric pipeline is identical to Phase 2; only the identity-binding step is added at the front.
+
+**Step 1 — Choose Verify Identity**
+
+After language selection (Phase 1), the action menu plays:
+> "You selected English. Press 1 to enroll. Press 2 to authenticate. Press 3 to verify your identity."
+
+Amina presses **3**. Twilio POSTs to `/twilio/voice/welcome/action?lang=en` with `Digits=3`. The handler redirects to `/twilio/voice/verify/start`.
+
+**Step 2 — Enter national ID**
+
+Twilio POSTs to: `POST /twilio/voice/verify/start?lang=en`
+
+The system plays:
+> "Please enter your national identity number followed by the pound key."
+
+Amina types her national ID on the keypad: `8267411571#`. Twilio fires the gather action `/twilio/voice/verify/nid` with `Digits=8267411571`.
+
+**Step 3 — Backend triggers eSignet OTP**
+
+`POST /twilio/voice/verify/nid?lang=en` (form: `Digits=8267411571`, `CallSid=CA…`)
+
+The backend's `MosipService.start_otp_auth(national_id)` runs the server-driven OAuth dance against eSignet:
+
+1. `GET /v1/esignet/csrf/token` → CSRF token + cookies
+2. `POST /v1/esignet/authorization/v3/oauth-details` with the registered `verivoice-client-cf7d48a7` `clientId`, PKCE challenge, nonce, state, `acrValues=mosip:idp:acr:generated-code` → returns `transactionId` + `oauth-details-hash`
+3. `POST /v1/esignet/authorization/send-otp` with `transactionId` + `individualId` + `otpChannels=["EMAIL","PHONE"]` → eSignet's mock-identity-system sends the OTP (in dev mode, the OTP **is** the user's PIN)
+
+The full session (transaction_id, oauth_details_key, oauth_details_hash, code_verifier, nonce, state, cookies_jar) is serialized to JSON and stored in Redis under `ivr:verify_session:{CallSid}` with a 10-minute TTL.
+
+> If `start_otp_auth` raises (invalid individual ID, eSignet down, client not registered), the IVR plays *"That identity could not be verified. Please try again."* and loops back to `/voice/verify/start`.
+
+**Step 4 — Prompt for OTP**
+
+Still in the same response, the system plays:
+> "An OTP has been sent. Please enter the six-digit OTP followed by the pound key."
+
+A `<Gather>` with `numDigits=6`, `finishOnKey=#`, `timeout=30` waits for keypad input. Amina types her PIN `111111#`.
+
+> **Mock dev note:** in eSignet's mock-identity-system the user's PIN doubles as the OTP, so you enter the same number you set when creating the user via `bash scripts/esignet_test_users/create_all.sh`. In production this would be a real OTP delivered out-of-band.
+
+**Step 5 — Backend verifies OTP and exchanges for id_token**
+
+`POST /twilio/voice/verify/otp?lang=en` (form: `Digits=111111`, `CallSid=CA…`)
+
+The backend reads the session from Redis using `CallSid`, then calls `MosipService.verify_otp_and_get_identity(session, national_id, otp)`:
+
+1. `POST /v1/esignet/authorization/v3/authenticate` with `transactionId`, `individualId`, and `challengeList=[{authFactorType:"OTP", challenge:<otp>, format:"alpha-numeric"}]`
+2. `POST /v1/esignet/authorization/auth-code` to convert the authenticated transaction into an OAuth `code`
+3. `POST /v1/esignet/oauth/v2/token` with the code + `private_key_jwt` client assertion (signed using `esignet_private_key.pem`, RS256)
+4. Validate the returned `id_token` against eSignet's JWKS (PS256 signature, issuer, audience, exp, nonce match) using PyJWT
+5. Extract the verified `sub` claim — that's the MOSIP `individual_id`
+
+> If anything fails — wrong OTP, expired session, signature invalid — the IVR plays *"OTP is incorrect. Please try again."* and loops back to `/voice/verify/start`.
+
+**Step 6 — Persist verified identity for the enrollment step**
+
+On success, the backend writes:
+```
+ivr:verified_identity:{CallSid} = {"national_id": "8267411571",
+                                    "mosip_individual_id": "s8-VG8_0sbZMmhKXB7qHS8L9yzlwTD2wvuY08p6kZsM"}
+```
+to Redis (10-min TTL), then deletes the `ivr:verify_session:{CallSid}` key. The system plays:
+> "Your identity has been verified. Now we will enroll your voice."
+
+…and **redirects to** `/voice/enroll?lang=en&step=0&national_id=8267411571`.
+
+**Step 7 — Voice enrollment (same as Phase 2)**
+
+The call now flows through Phase 2 exactly as documented above: 5 random phrase recordings, ECAPA-TDNN embeddings, Paillier HE encryption, store in `VOICE_TEMPLATE`. The only difference is that when the enrollment background task creates the `CITIZEN` row, it reads `ivr:verified_identity:{CallSid}` from Redis, finds the `mosip_individual_id` for this call, and creates the row with:
+
+- `national_id_number = "8267411571"` (from URL)
+- `mosip_individual_id = "s8-VG8_0sbZMmhKXB7qHS8L9yzlwTD2wvuY08p6kZsM"` (from Redis)
+- `identity_verified = True`
+
+The Redis verification key is consumed (one-time use) so the same verification can't be replayed for a different enrollment.
+
+**Step 8 — Enrollment complete**
+
+After the 5th recording is processed, the system plays:
+> "Enrollment complete. Thank you."
+
+The call ends. The new citizen is now MOSIP-verified — Streamlit's "MOSIP Verified" badge will show, and any future authentication via Phase 3 will reflect the verified status.
+
+**Endpoint summary for this phase**
+
+| Step | Endpoint | Inputs | Notes |
+|---|---|---|---|
+| 2 | `POST /twilio/voice/verify/start` | `lang` (query) | Plays NID prompt + Gather |
+| 3 | `POST /twilio/voice/verify/nid` | `Digits` (form), `lang` (query), `CallSid` (form) | Calls eSignet `oauth-details` + `send-otp`, stores session in Redis |
+| 5 | `POST /twilio/voice/verify/otp` | `Digits` (form, 6-digit OTP), `lang` (query), `CallSid` (form) | Calls eSignet `authenticate` + `auth-code` + `token`, validates JWT, extracts MOSIP `sub`, redirects to `/voice/enroll` |
+| 7 | `POST /twilio/voice/enroll?step=0&national_id={nid}` | -- | Standard Phase 2 enrollment, but reads `ivr:verified_identity:{CallSid}` to link MOSIP ID |
+
+**Common failure modes**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `eSignet start_otp_auth failed: 'NoneType' object is not subscriptable` | OIDC client `verivoice-client-cf7d48a7` not registered (likely after `docker compose down`) | Re-register the client — see `docs/esignet_local_setup.md` Section 3 |
+| `That identity could not be verified` | National ID doesn't exist in `mock-identity-system` | Run `bash scripts/esignet_test_users/create_all.sh` |
+| `OTP is incorrect` | Wrong PIN entered, or session expired (>10 min between NID and OTP) | Restart from Press 3, enter the correct PIN (which equals the OTP in mock mode) |
+| `Session expired. Please start again.` | Caller waited too long between steps | The verify session has a 10-minute TTL — start over |
+
+For deeper detail on the eSignet endpoints used, see `docs/ivr_verify_flow.md`.
 
 ---
 
