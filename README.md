@@ -28,7 +28,7 @@ Service Access: pick 1 of 5 services via DTMF -> 3 questions + read-back
 - Python 3.10+
 - Java 11+ (for MOSIP Mock MDS biometric device simulators)
 - Redis (for session/OIDC state management)
-- ~4 GB disk space (for Whisper large-v3 model, downloaded on first use)
+- ~8 GB disk space (for ML model weights: Whisper ~3GB, w2v-BERT Swahili ~4.5GB, ECAPA-TDNN ~90MB)
 - GPU optional (auto-detects CUDA, falls back to CPU)
 
 ### Setup
@@ -46,13 +46,16 @@ venv\Scripts\activate           # Windows
 # Install dependencies
 pip install -r requirements.txt
 
+# Pre-download ML model weights (~8 GB, one-time)
+python scripts/download_models.py
+
 # Create your .env file
 cp .env.example .env
 
 # Run database migrations
 alembic upgrade head
 
-# Start the API server
+# Start the API server (models auto-warm on boot)
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -131,7 +134,7 @@ All audio endpoints accept `multipart/form-data` and return JSON.
 
 **IVR authentication pipeline:** The IVR auth callback downloads the Twilio recording, runs the full dual-stage pipeline (ECAPA-TDNN voice biometric match + Whisper/w2v-BERT transcript match), announces the score, and routes accordingly. This is the same pipeline used by the REST API `POST /api/v1/authenticate`.
 
-All IVR voice recordings use **keypad # to stop** (silence detection is disabled). The caller hears a beep, speaks, and presses `#` when done. This gives callers explicit control and prevents mid-sentence cutoffs.
+All IVR voice recordings use **keypad # to stop** or **5-second silence auto-stop**. The caller hears a beep, speaks, and presses `#` when done (or waits 5s of silence for auto-submit). DTMF gathers allow 30 seconds for input. Processing hold messages repeat every 20 seconds for up to 5 minutes while ML pipelines run in the background.
 
 **IVR TTS strategy:** English prompts use Twilio's built-in `<Say voice="alice">` (zero latency). Swahili prompts use gTTS-generated audio served via `<Play>` — Google TTS has proper Swahili pronunciation while Twilio's `alice` voice does not. Audio files are served from `/tts-audio/` with automatic caching of repeated prompts. Set `PUBLIC_BASE_URL` to your ngrok URL in `.env`.
 
@@ -182,7 +185,7 @@ Both stages must pass for access to be granted:
 | API Framework | FastAPI + Uvicorn |
 | Speaker Verification | SpeechBrain ECAPA-TDNN (192-dim embeddings) |
 | Speech-to-Text (English) | OpenAI Whisper (large-v3) |
-| Speech-to-Text (Swahili) | w2v-BERT 2.0 (`badrex/w2v-bert-2.0-swahili-as`) |
+| Speech-to-Text (Swahili) | w2v-BERT 2.0 (`badrex/w2v-bert-2.0-swahili-asr`) |
 | Text-to-Speech | gTTS |
 | Homomorphic Encryption | python-paillier (2048-bit Paillier) |
 | Digital Signatures | PyNaCl (Ed25519) |
@@ -261,7 +264,7 @@ Key parameters:
 | `TRANSCRIPT_MATCH_THRESHOLD` | 0.75 | Word-level similarity threshold for phrase 2FA |
 | `PAILLIER_BITS` | 2048 | Paillier key size |
 | `WHISPER_MODEL` | large-v3 | Whisper ASR model (English) |
-| `SWAHILI_ASR_MODEL` | badrex/w2v-bert-2.0-swahili-as | w2v-BERT ASR model (Swahili) |
+| `SWAHILI_ASR_MODEL` | badrex/w2v-bert-2.0-swahili-asr | w2v-BERT ASR model (Swahili) |
 | `ECAPA_SOURCE` | speechbrain/spkrec-ecapa-voxceleb | Speaker embedding model |
 | `ENROLLMENT_PHRASES` | 5 | Number of voice samples for enrollment |
 | `ESIGNET_BASE_URL` | *(env)* | MOSIP e-Signet server URL |
@@ -269,13 +272,162 @@ Key parameters:
 | `ESIGNET_REDIRECT_URI` | `http://localhost:8000/api/v1/mosip/callback` | OIDC callback URL |
 | `ESIGNET_SCOPES` | `openid profile` | OIDC scopes |
 
-## Twilio Setup (IVR)
+## Full Development Setup (IVR + eSignet)
 
-To test the phone-based IVR flow:
+This section covers the complete local setup for testing the phone-based IVR flow with optional MOSIP eSignet identity verification.
 
-1. Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_PHONE_NUMBER` in `.env`
-2. Expose your local server via [ngrok](https://ngrok.com/): `ngrok http 8000`
-3. Set your Twilio phone number's Voice webhook to `https://<ngrok-url>/twilio/voice/welcome`
+### 1. Start Redis
+
+Redis is required for challenge phrase sessions, OIDC state/nonce, and IVR verified-identity tokens.
+
+```bash
+# If using Docker:
+docker run -d --name verivoice-redis -p 6379:6379 redis:7-alpine
+
+# Or if Redis is installed locally:
+redis-server
+```
+
+Verify: `redis-cli ping` should return `PONG`.
+
+### 2. Start the VeriVoice Backend
+
+```bash
+# Activate your virtual environment
+venv\Scripts\activate           # Windows
+# source venv/bin/activate      # macOS/Linux
+
+# Pre-download ML models (one-time, ~8 GB)
+python scripts/download_models.py
+
+# Run database migrations (first time or after schema changes)
+alembic upgrade head
+
+# Start the FastAPI server (models auto-warm on boot)
+uvicorn app.main:app --reload --port 8000
+```
+
+On startup, all 3 ML models (ECAPA-TDNN, Whisper large-v3, w2v-BERT Swahili) are loaded into memory in a background thread. The `/health` endpoint responds immediately; models are ready by the time the first real request arrives.
+
+Verify: `curl http://localhost:8000/health` should return `{"status":"ok","version":"0.1.0"}`.
+
+### 3. Start ngrok (Twilio Tunnel)
+
+Twilio needs a public URL to reach your local server for webhooks and to fetch gTTS audio files.
+
+```bash
+ngrok http 8000
+```
+
+Copy the `https://` forwarding URL (e.g., `https://abcd-1234.ngrok-free.app`).
+
+Update `.env`:
+```env
+PUBLIC_BASE_URL=https://abcd-1234.ngrok-free.app
+```
+
+> **Important:** Restart the backend after changing `PUBLIC_BASE_URL` so gTTS audio URLs point to the correct ngrok address.
+
+### 4. Configure Twilio
+
+1. Set your Twilio credentials in `.env`:
+   ```env
+   TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   TWILIO_AUTH_TOKEN=your_auth_token_here
+   TWILIO_PHONE_NUMBER=+1234567890
+   ```
+
+2. In the [Twilio Console](https://console.twilio.com/), go to **Phone Numbers** > your number > **Voice Configuration**:
+   - **A call comes in:** Webhook
+   - **URL:** `https://<your-ngrok-url>/twilio/voice/welcome`
+   - **HTTP Method:** POST
+
+3. Call your Twilio number — you should hear _"Welcome to VeriVoice. Press 1 for English. Press 2 for Swahili."_
+
+### 5. Start eSignet (Optional — for Identity Verification)
+
+Required only if testing the IVR identity verification flow (Press 3 from the main menu). Two options:
+
+#### Option A: Local Docker Stack
+
+```bash
+# Clone the eSignet repo (one-time)
+git clone https://github.com/mosip/esignet.git
+cd esignet/docker-compose
+
+# Start the stack
+docker compose --file docker-compose.yml up -d
+```
+
+This starts:
+
+| Service | URL |
+|---|---|
+| eSignet UI | http://localhost:3000 |
+| eSignet Backend | http://localhost:8088 |
+| Mock Identity System | http://localhost:8082 |
+| PostgreSQL | localhost:5455 |
+| Redis (eSignet) | localhost:6379 |
+
+Verify:
+```bash
+curl http://localhost:8088/v1/esignet/actuator/health
+curl http://localhost:8082/v1/mock-identity-system/actuator/health
+```
+
+Update `.env` for local Docker:
+```env
+ESIGNET_BASE_URL=http://localhost:8088
+ESIGNET_UI_URL=http://localhost:3000
+ESIGNET_ISSUER=http://localhost:8088/v1/esignet
+ESIGNET_CLIENT_ID=your_registered_client_id
+ESIGNET_REDIRECT_URI=http://localhost:8000/api/v1/mosip/callback
+ESIGNET_PRIVATE_KEY_PATH=./esignet_private_key.pem
+```
+
+> See `docs/esignet_local_setup.md` for RSA key generation, OIDC client registration, and mock identity creation.
+
+#### Option B: MOSIP Collab Environment
+
+Use the hosted MOSIP collab sandbox instead of running Docker locally:
+
+```env
+ESIGNET_BASE_URL=https://esignet.collab.mosip.net
+ESIGNET_JWKS_URI=https://esignet.collab.mosip.net/.well-known/jwks.json
+```
+
+### 6. Start Mock MDS (Optional — for Browser-Based eSignet)
+
+Only needed if testing eSignet via a browser (the Streamlit UI path). The IVR path uses server-driven OTP and does **not** need Mock MDS.
+
+```bash
+# Terminal: Registration Mock MDS (port 4501)
+cd MOSIP_eSignet/collab-mock-mds-reg/target
+java -cp "classes;lib/*" io.mosip.mock.sbi.test.TestMockSBI \
+  "mosip.mock.sbi.device.purpose=Registration" \
+  "mosip.mock.sbi.biometric.type=Biometric Device"
+
+# Terminal: Auth Mock MDS (port 4502)
+cd MOSIP_eSignet/collab-mock-mds-auth/target
+java -cp "mock-mds-1.2.1-SNAPSHOT.jar;lib/*" io.mosip.mock.sbi.test.TestMockSBI \
+  "mosip.mock.sbi.device.purpose=Auth" \
+  "mosip.mock.sbi.biometric.type=Biometric Device"
+```
+
+Requires Java 11+. Verify: `netstat -ano | findstr :4501`
+
+### Startup Checklist
+
+| # | Component | Command | Required? |
+|---|---|---|---|
+| 0 | Download ML models | `python scripts/download_models.py` | First time only (~8 GB) |
+| 1 | Redis | `docker run -d -p 6379:6379 redis:7-alpine` | Always |
+| 2 | VeriVoice Backend | `uvicorn app.main:app --reload --port 8000` | Always (auto-warms models) |
+| 3 | ngrok | `ngrok http 8000` | For IVR |
+| 4 | Twilio webhook | Configure in Twilio Console | For IVR |
+| 5 | eSignet Docker | `docker compose up -d` | For identity verification |
+| 6 | Mock MDS (Java) | See above | For browser-based eSignet only |
+| 7 | Streamlit UI | `streamlit run streamlit_app/app.py --server.port 8501` | For web demo |
 
 ## Security
 
@@ -289,6 +441,24 @@ To test the phone-based IVR flow:
 - **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
 
 ## Changelog
+
+### v1.9.6 (2026-05-04)
+
+**New Features**
+- **Pre-download ML models script** — `python scripts/download_models.py` caches all 3 model weights (ECAPA-TDNN ~90MB, Whisper large-v3 ~3GB, w2v-BERT Swahili ~4.5GB) so the first server start doesn't block on downloads (`scripts/download_models.py`)
+- **Auto-warm models on server start** — FastAPI lifespan hook loads ECAPA-TDNN, Whisper, and w2v-BERT into memory in a background thread at boot. `/health` responds immediately; models are ready before the first real request (`app/main.py`)
+
+### v1.9.5 (2026-05-04)
+
+**Fixes**
+- **Swahili ASR model loading** — Fixed 3 bugs preventing `badrex/w2v-bert-2.0-swahili-asr` from loading: model name typo (`-as` → `-asr`), wrong loader classes (`Auto*` → `Wav2Vec2Bert*`), wrong tensor key (`input_values` → `input_features`) (`app/config.py`, `app/services/transcription_service.py`)
+
+### v1.9.4 (2026-05-04)
+
+**Improvements**
+- **IVR DTMF timeouts increased** — All gather timeouts raised from 5-10s to 30s, giving callers more time to respond (`twilio_integration/webhook_handler.py`)
+- **Hold audio extended to 5 minutes** — Processing steps now keep the call alive for up to 5 min (was ~3 min). Reassurance message repeats once every 20 seconds (was every ~3s) to reduce caller irritation (`twilio_integration/webhook_handler.py`)
+- **Recording silence auto-stop** — All `<Record>` verbs now have `timeout=5` (5s of silence ends the recording) instead of `timeout=0` (disabled). Callers can still press `#` to end early (`twilio_integration/webhook_handler.py`)
 
 ### v1.7.0 (2026-04-05)
 
@@ -355,13 +525,13 @@ To test the phone-based IVR flow:
 ### v1.3.0 (2026-04-02)
 
 **New Features**
-- **Dual ASR: w2v-BERT for Swahili, Whisper for English** -- `TranscriptionService` now routes Swahili (`language="sw"`) to `badrex/w2v-bert-2.0-swahili-as` (a fine-tuned w2v-BERT 2.0 CTC model that outperforms Whisper large-v3 on Swahili speech) and keeps Whisper large-v3 for English and all other languages. Both models are lazy-loaded singletons. Applies to all flows: authentication, consent, and service access — in both IVR and Streamlit (`app/services/transcription_service.py`, `app/config.py`)
+- **Dual ASR: w2v-BERT for Swahili, Whisper for English** -- `TranscriptionService` now routes Swahili (`language="sw"`) to `badrex/w2v-bert-2.0-swahili-asr` (a fine-tuned w2v-BERT 2.0 CTC model that outperforms Whisper large-v3 on Swahili speech) and keeps Whisper large-v3 for English and all other languages. Both models are lazy-loaded singletons. Applies to all flows: authentication, consent, and service access — in both IVR and Streamlit (`app/services/transcription_service.py`, `app/config.py`)
 
 **Files Changed**
 | File | Change |
 |---|---|
 | `app/services/transcription_service.py` | Rewritten with dual backend: `_transcribe_whisper()` + `_transcribe_swahili()`, auto-routed by language |
-| `app/config.py` | Added `SWAHILI_ASR_MODEL` setting (default: `badrex/w2v-bert-2.0-swahili-as`) |
+| `app/config.py` | Added `SWAHILI_ASR_MODEL` setting (default: `badrex/w2v-bert-2.0-swahili-asr`) |
 | `README.md` | Updated tech stack, config table, auth flow description, changelog |
 | `VeriVoice_PRD.md` | Updated ASR references for dual-model architecture |
 | `docs/Twilio_IVR_Setup&Docs.md` | Updated auth walkthrough to mention language-specific ASR |
@@ -393,7 +563,7 @@ To test the phone-based IVR flow:
 - **MOSIP verification badges** -- Enroll and Authenticate page headers show "MOSIP Verified" or "Unverified" status; sidebar displays verified MOSIP ID (`streamlit_app/app.py`)
 - **MOSIP-aware enrollment toggle** -- When a MOSIP identity is verified in the session, the Enroll page shows "Use Verified MOSIP Identity for Enrollment" toggle (`streamlit_app/app.py`)
 - **MOSIP Mock MDS tooling** -- Pre-built Java services for simulating biometric capture devices (SBI protocol) during development. Registration MDS (port 4501) and Auth MDS (port 4502) (`MOSIP_eSignet/`)
-- **IVR keypad-stop recordings** -- Replaced silence-based auto-stop with explicit `#` keypress to end recordings (`timeout=0`, `finishOnKey=#`). Adds bilingual "Press pound when you are done" / "Bonyeza # ukimaliza" prompt before every recording. Prevents mid-sentence cutoffs from pauses (`twilio_integration/webhook_handler.py`)
+- **IVR keypad-stop recordings** -- Added explicit `#` keypress to end recordings (`finishOnKey=#`) with 5-second silence auto-stop (`timeout=5`). Adds bilingual "Press pound when you are done" / "Bonyeza # ukimaliza" prompt before every recording. Prevents mid-sentence cutoffs from pauses (`twilio_integration/webhook_handler.py`)
 - **Twilio Dev Phone** -- Added Twilio Dev Phone tooling for browser-based IVR testing without a physical phone (`dev-phone/`)
 
 **Schema/DB Changes**
