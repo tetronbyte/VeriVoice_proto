@@ -33,6 +33,7 @@ class TranscriptionService:
                 cls._instance._sw_model = None
                 cls._instance._sw_processor = None
                 cls._instance._sw_model_name = settings.SWAHILI_ASR_MODEL
+                cls._instance._sw_load_failed = False
                 cls._instance._device = None
         return cls._instance
 
@@ -46,16 +47,34 @@ class TranscriptionService:
         self._device = device
         self._whisper_model = whisper.load_model(self._whisper_model_name, device=device)
 
-    def _ensure_swahili(self) -> None:
-        """Lazy-load the w2v-BERT Swahili model on first use."""
-        if self._sw_model is not None:
-            return
-        from transformers import AutoModelForCTC, AutoProcessor
+    def _ensure_swahili(self) -> bool:
+        """Lazy-load the w2v-BERT Swahili model on first use.
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device = device
-        self._sw_processor = AutoProcessor.from_pretrained(self._sw_model_name)
-        self._sw_model = AutoModelForCTC.from_pretrained(self._sw_model_name).to(device)
+        Returns True if the dedicated Swahili model loaded, False if loading
+        failed (in which case the caller should fall back to Whisper).
+        """
+        if self._sw_model is not None:
+            return True
+        if self._sw_load_failed:
+            return False
+        try:
+            from transformers import Wav2Vec2BertForCTC, Wav2Vec2BertProcessor
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._device = device
+            self._sw_processor = Wav2Vec2BertProcessor.from_pretrained(self._sw_model_name)
+            self._sw_model = Wav2Vec2BertForCTC.from_pretrained(self._sw_model_name).to(device)
+            return True
+        except Exception as exc:
+            print(
+                f"[TranscriptionService] Swahili model '{self._sw_model_name}' unavailable "
+                f"({exc.__class__.__name__}: {exc}); falling back to Whisper for Swahili.",
+                flush=True,
+            )
+            self._sw_load_failed = True
+            self._sw_model = None
+            self._sw_processor = None
+            return False
 
     def _load_audio(self, audio: np.ndarray | str) -> np.ndarray:
         """Normalise input to a float32 numpy array at 16 kHz."""
@@ -74,15 +93,16 @@ class TranscriptionService:
         return result["text"].strip()
 
     def _transcribe_swahili(self, audio: np.ndarray) -> str:
-        """Transcribe using w2v-BERT Swahili model (CTC)."""
-        self._ensure_swahili()
+        """Transcribe using w2v-BERT Swahili model (CTC) — falls back to Whisper."""
+        if not self._ensure_swahili():
+            return self._transcribe_whisper(audio, language="sw")
         inputs = self._sw_processor(
             audio, sampling_rate=16000, return_tensors="pt"
         )
         input_features = inputs.input_features.to(self._device)
 
         with torch.no_grad():
-            logits = self._sw_model(input_features).logits
+            logits = self._sw_model(input_features=input_features).logits
 
         predicted_ids = torch.argmax(logits, dim=-1)
         text = self._sw_processor.batch_decode(predicted_ids)[0]
