@@ -118,7 +118,7 @@ ESIGNET_SCOPES=openid profile
 
 And start the MOSIP Mock MDS services (see README.md for commands). The Mock MDS simulates biometric capture devices (fingerprint, iris, face) on localhost ports 4501-4600 so that e-Signet can perform biometric authentication without real hardware.
 
-> **Note:** MOSIP identity verification is primarily used via the Streamlit web UI or direct API calls. The IVR flow currently supports voice-only enrollment without MOSIP verification. Integrating MOSIP into the IVR flow would require a web-based pre-verification step before the caller dials in.
+> **Note:** MOSIP identity verification is available in the IVR via **Press 3** at the main menu. This uses eSignet's server-driven OAuth endpoints over DTMF — no browser, no SMS. The caller enters their national ID and OTP on the keypad, and the backend verifies their identity against eSignet before proceeding into voice enrollment with `identity_verified=True`. See Phase 2b below and [`ivr_verify_flow.md`](ivr_verify_flow.md) for the detailed flow. Alternatively, identity can be verified via the Streamlit web UI or direct API calls.
 
 ## 5. Exposing Your Local Server (ngrok)
 
@@ -1182,7 +1182,7 @@ This test takes ~90 seconds (loads ECAPA-TDNN + Whisper models) and verifies:
 | Swahili prompts not playing | `PUBLIC_BASE_URL` doesn't match your ngrok URL | Set `PUBLIC_BASE_URL` in `.env` to your current ngrok URL (e.g., `https://a1b2c3d4.ngrok-free.app`). Twilio fetches gTTS audio from this URL |
 | Swahili audio sounds robotic | gTTS quality is lower than commercial TTS | Expected — gTTS is free-tier Google Translate TTS. Quality is acceptable for a prototype and far better than Twilio `alice` mispronouncing Swahili |
 | Read-back summary has wrong answers | Query parameter encoding issue with special characters in names | URL-encode answer values; check ngrok inspector for the raw query string |
-| MOSIP identity verification not available in IVR | By design -- e-Signet OIDC requires a web browser | Use the Streamlit UI (`/Verify Identity`) to verify via MOSIP before or after IVR enrollment |
+| MOSIP identity verification fails in IVR | eSignet Docker stack not running, or mock user not created | Start eSignet (`docker compose up -d`), create test users (`bash scripts/esignet_test_users/create_all.sh`). See Phase 2b and [`ivr_verify_flow.md`](ivr_verify_flow.md) |
 | Redis connection refused | Redis not running or wrong URL | Start Redis (`redis-server`) and check `REDIS_URL` in `.env` |
 
 ---

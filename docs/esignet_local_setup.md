@@ -11,7 +11,7 @@ Local eSignet stack used for VeriVoice OIDC integration testing. No MOSIP collab
 ## 1. Start the eSignet stack
 
 ```bash
-cd C:/Users/adire/Documents/esignet/docker-compose
+cd <path-to-esignet-repo>/docker-compose
 docker compose --file docker-compose.yml up -d
 ```
 
@@ -212,6 +212,6 @@ VeriVoice's callback handler should exchange the `code` for an `id_token` using 
 ## Stopping the stack
 
 ```bash
-cd C:/Users/adire/Documents/esignet/docker-compose
+cd <path-to-esignet-repo>/docker-compose
 docker compose --file docker-compose.yml down
 ```
