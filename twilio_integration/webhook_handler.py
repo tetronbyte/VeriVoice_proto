@@ -191,7 +191,7 @@ async def _validate_twilio_request(request: Request) -> None:
 @router.post("/voice/welcome")
 async def welcome(request: Request):
     """Play welcome message and prompt for language selection via DTMF."""
-    print("[IVR WELCOME] >>> Call received. Playing: 'Welcome to VeriVoice. Press 1 for English. Press 2 for Swahili.'", flush=True)
+    print("[IVR WELCOME] >>> Call received. Playing: 'Welcome to VeriVoice. Press 1 for English.' + [SW] 'Bonyeza 2 kwa Kiswahili.'", flush=True)
     await _validate_twilio_request(request)
     response = VoiceResponse()
     gather = Gather(
@@ -200,12 +200,15 @@ async def welcome(request: Request):
         method="POST",
         timeout=30,
     )
-    # Welcome is always in English — caller hasn't chosen a language yet
+    # English part via Twilio Say
     gather.say(
-        "Welcome to VeriVoice. Press 1 for English. Press 2 for Swahili.",
+        "Welcome to VeriVoice. Press 1 for English.",
         voice="alice",
         language="en-US",
     )
+    # Swahili part via gTTS — so Swahili speakers hear their option in Swahili
+    sw_url = _tts_service.synthesize_with_url("Bonyeza 2 kwa Kiswahili.", language="sw")
+    gather.play(sw_url)
     response.append(gather)
     # No language selected yet — say in both English and Swahili
     response.say("No input received. Defaulting to English.", voice="alice", language="en-US")
