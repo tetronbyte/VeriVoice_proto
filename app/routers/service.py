@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
@@ -16,6 +17,7 @@ from app.schemas.consent import ServiceAccessResponse, ServiceFormSummary
 from app.services.transcription_service import TranscriptionService
 from app.services.tts_service import TTSService
 from app.services.audio_preprocessor import AudioPreprocessor
+from app.utils.upload_validation import validate_audio_upload
 
 router = APIRouter()
 
@@ -41,6 +43,8 @@ FORM_FIELD_KEYS = ["full_name", "dependants", "primary_facility"]
 
 def _parse_dependants(raw: str) -> str:
     """Try to normalise a spoken number to a digit string."""
+    if not raw or not raw.strip():
+        return ""
     word_map = {
         "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
         "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
@@ -88,6 +92,9 @@ async def service_access(
     if token.is_revoked:
         logger.warning("[SERVICE] ── Token %s is revoked", consent_token_id)
         raise HTTPException(status_code=403, detail="Consent token has been revoked")
+    if token.expires_at and datetime.now(timezone.utc) > token.expires_at:
+        logger.warning("[SERVICE] ── Token %s has expired", consent_token_id)
+        raise HTTPException(status_code=403, detail="Consent token has expired")
 
     # ── Resolve language and question ────────────────────────────────────
     lang = citizen.preferred_language or "en"
@@ -99,7 +106,7 @@ async def service_access(
                  qi + 1, len(q_list), field_key, lang, question)
 
     # ── Read and preprocess audio ────────────────────────────────────────
-    raw_bytes = await audio_file.read()
+    raw_bytes = await validate_audio_upload(audio_file)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(raw_bytes)
         tmp_path = tmp.name

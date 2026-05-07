@@ -22,15 +22,28 @@ class EncryptionService:
         self._public_key, self._private_key = self._load_or_generate_keys()
 
     def _load_or_generate_keys(self) -> tuple[paillier.PaillierPublicKey, paillier.PaillierPrivateKey]:
-        """Load keys from disk, or generate and save a new keypair."""
+        """Load keys from disk, or generate and save a new keypair.
+
+        Validates loaded keys with a small encrypt/decrypt round-trip.
+        Raises RuntimeError if keys are corrupt or cannot be generated.
+        """
         import pathlib
 
-        if pathlib.Path(self._key_path).exists():
-            return load_paillier_keys(self._key_path)
+        try:
+            if pathlib.Path(self._key_path).exists():
+                pub, priv = load_paillier_keys(self._key_path)
+                # Validate: small round-trip
+                test_ct = pub.encrypt(42)
+                assert priv.decrypt(test_ct) == 42, "Key validation round-trip failed"
+                return pub, priv
 
-        public_key, private_key = generate_paillier_keypair(self._n_length)
-        save_paillier_keys(public_key, private_key, self._key_path)
-        return public_key, private_key
+            public_key, private_key = generate_paillier_keypair(self._n_length)
+            save_paillier_keys(public_key, private_key, self._key_path)
+            return public_key, private_key
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load/generate Paillier keys from {self._key_path}: {exc}"
+            ) from exc
 
     @property
     def public_key(self) -> paillier.PaillierPublicKey:

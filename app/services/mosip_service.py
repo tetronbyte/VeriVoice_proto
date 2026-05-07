@@ -21,8 +21,20 @@ _OIDC_TTL_SECONDS = 300  # 5-minute TTL for state/nonce
 
 class MosipService:
     def __init__(self) -> None:
-        self._redis = redis.from_url(settings.REDIS_URL, decode_responses=True)
+        self._redis_instance: redis.Redis | None = None
         self._jwks_cache: dict | None = None
+
+    @property
+    def _redis(self) -> redis.Redis:
+        """Lazy Redis connection — connects on first access, fails clearly."""
+        if self._redis_instance is None:
+            try:
+                self._redis_instance = redis.from_url(settings.REDIS_URL, decode_responses=True)
+                self._redis_instance.ping()
+            except redis.ConnectionError as exc:
+                self._redis_instance = None
+                raise RuntimeError(f"Redis unavailable — MOSIP OIDC requires Redis: {exc}") from exc
+        return self._redis_instance
 
     # ── OIDC State Management ───────────────────────────────────────────────
 

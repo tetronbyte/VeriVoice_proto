@@ -82,6 +82,10 @@ class ChallengeService:
         """
         import random
 
+        # Prevent unbounded memory growth — clear if too many stale entries
+        if len(self._active) > 1000:
+            self._active.clear()
+
         pool = self._pools.get(language)
         if pool is None:
             raise ValueError(f"No phrase pool for language '{language}'")
@@ -113,6 +117,10 @@ class ChallengeService:
             raise KeyError(f"Challenge ID '{challenge_id}' not found")
 
         score, matched, total = _word_similarity(_normalize(transcript), expected)
+
+        # Clean up consumed challenge to prevent memory leak
+        del self._active[challenge_id]
+
         return {
             "match": score >= threshold,
             "score": round(score, 4),

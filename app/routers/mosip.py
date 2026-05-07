@@ -73,10 +73,7 @@ async def mosip_callback(
     _mosip_service.store_verified_identity(state, individual_id)
 
     # Also keep the legacy per-individual marker (5-min TTL)
-    import redis as _redis_mod
-    from app.config import settings as _settings
-    _r = _redis_mod.from_url(_settings.REDIS_URL, decode_responses=True)
-    _r.setex(f"esignet:verified:{individual_id}", 300, "1")
+    _mosip_service._redis.setex(f"esignet:verified:{individual_id}", 300, "1")
 
     linked_citizen_id = None
 

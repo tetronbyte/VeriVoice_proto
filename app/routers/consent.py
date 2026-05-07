@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger("verivoice.consent")
 
+from app.services.confirmation_service import classify_yes_no
+from app.utils.upload_validation import validate_audio_upload
 from app.db.crud import (
     create_consent_token,
     get_active_template,
@@ -59,7 +61,7 @@ async def consent(
     logger.info("[CONSENT] ── Citizen resolved: %s template=%s", citizen.citizen_id, template.template_id)
 
     # ── Read and preprocess audio ────────────────────────────────────────
-    raw_bytes = await audio_file.read()
+    raw_bytes = await validate_audio_upload(audio_file)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(raw_bytes)
         tmp_path = tmp.name
@@ -92,8 +94,16 @@ async def consent(
     transcription_service = TranscriptionService()
     transcript = transcription_service.transcribe(preprocessed, language=citizen.preferred_language)
     logger.info("[CONSENT] ── Transcript: '%s'", transcript)
-    # For prototype: accept any non-empty transcript as affirmative consent
-    # (production would check for "yes", "ndiyo", etc.)
+
+    intent = classify_yes_no(transcript, citizen.preferred_language)
+    logger.info("[CONSENT] ── Intent: %s", intent)
+    if intent == "no":
+        raise HTTPException(status_code=403, detail="Consent declined by speaker")
+    if intent != "yes":
+        raise HTTPException(
+            status_code=400,
+            detail="Could not determine consent intent from audio — please say 'yes' or 'no' clearly",
+        )
 
     # ── Ed25519 sign consent payload ─────────────────────────────────────
     issued_at = datetime.now(timezone.utc)

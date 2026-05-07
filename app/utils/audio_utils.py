@@ -4,6 +4,10 @@ import numpy as np
 import librosa
 
 
+class SilentAudioError(Exception):
+    """Raised when the audio peak amplitude is below the rejection threshold."""
+
+
 def load_audio(source: str | np.ndarray, sample_rate: int = 16000) -> np.ndarray:
     """Load audio from a file path or pass through a numpy array.
 
@@ -63,5 +67,5 @@ def vad_trim(audio: np.ndarray, top_db: int = 25) -> np.ndarray:
     """Extract voiced segments using librosa VAD and concatenate them."""
     intervals = librosa.effects.split(audio, top_db=top_db)
     if len(intervals) == 0:
-        return audio
+        raise SilentAudioError("No voiced segments detected by VAD (audio may be noise-only)")
     return np.concatenate([audio[start:end] for start, end in intervals]).astype(np.float32)

@@ -60,21 +60,25 @@ def create_voice_template(
     citizen_id: str,
     he_ciphertext: bytes,
 ) -> VoiceTemplate:
-    # Deactivate any existing active templates for this citizen
-    db.query(VoiceTemplate).filter(
-        VoiceTemplate.citizen_id == citizen_id,
-        VoiceTemplate.is_active == True,  # noqa: E712
-    ).update({"is_active": False})
+    try:
+        # Deactivate any existing active templates for this citizen
+        db.query(VoiceTemplate).filter(
+            VoiceTemplate.citizen_id == citizen_id,
+            VoiceTemplate.is_active == True,  # noqa: E712
+        ).update({"is_active": False})
 
-    template = VoiceTemplate(
-        citizen_id=citizen_id,
-        he_ciphertext=he_ciphertext,
-        is_active=True,
-    )
-    db.add(template)
-    db.commit()
-    db.refresh(template)
-    return template
+        template = VoiceTemplate(
+            citizen_id=citizen_id,
+            he_ciphertext=he_ciphertext,
+            is_active=True,
+        )
+        db.add(template)
+        db.commit()
+        db.refresh(template)
+        return template
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_active_template(db: Session, citizen_id: str) -> VoiceTemplate | None:

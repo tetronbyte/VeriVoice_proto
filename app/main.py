@@ -21,6 +21,13 @@ logging.getLogger("verivoice").setLevel(logging.INFO)
 
 logger = logging.getLogger("verivoice.startup")
 
+# Model readiness tracking — updated by _warmup_models(), read by /health
+_model_status: dict[str, str] = {
+    "ecapa_tdnn": "loading",
+    "whisper": "loading",
+    "w2v_bert_swahili": "loading",
+}
+
 
 def _warmup_models() -> None:
     """Load all ML models into memory so the first request is fast.
@@ -35,8 +42,10 @@ def _warmup_models() -> None:
         from app.services.embedding_service import EmbeddingService
 
         EmbeddingService()._ensure_model()
+        _model_status["ecapa_tdnn"] = "ready"
         logger.info("  ECAPA-TDNN loaded.")
     except Exception as e:
+        _model_status["ecapa_tdnn"] = "failed"
         logger.warning("  ECAPA-TDNN warmup failed: %s", e)
 
     # 2. Whisper (English ASR)
@@ -45,8 +54,10 @@ def _warmup_models() -> None:
 
         svc = TranscriptionService()
         svc._ensure_whisper()
+        _model_status["whisper"] = "ready"
         logger.info("  Whisper %s loaded.", settings.WHISPER_MODEL)
     except Exception as e:
+        _model_status["whisper"] = "failed"
         logger.warning("  Whisper warmup failed: %s", e)
 
     # 3. w2v-BERT Swahili ASR
@@ -56,10 +67,13 @@ def _warmup_models() -> None:
         svc = TranscriptionService()
         loaded = svc._ensure_swahili()
         if loaded:
+            _model_status["w2v_bert_swahili"] = "ready"
             logger.info("  w2v-BERT Swahili loaded.")
         else:
+            _model_status["w2v_bert_swahili"] = "failed"
             logger.warning("  w2v-BERT Swahili failed to load (will fall back to Whisper).")
     except Exception as e:
+        _model_status["w2v_bert_swahili"] = "failed"
         logger.warning("  w2v-BERT Swahili warmup failed: %s", e)
 
     logger.info("Model warmup complete.")
@@ -91,4 +105,14 @@ app.mount("/tts-audio", StaticFiles(directory=str(_tts_dir)), name="tts-audio")
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "version": app.version}
+    from fastapi.responses import JSONResponse
+
+    all_ready = all(v == "ready" for v in _model_status.values())
+    return JSONResponse(
+        content={
+            "status": "ok" if all_ready else "warming_up",
+            "version": app.version,
+            "models": dict(_model_status),
+        },
+        status_code=200 if all_ready else 503,
+    )

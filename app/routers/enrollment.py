@@ -2,6 +2,7 @@
 
 import io
 import logging
+import os
 import tempfile
 
 import numpy as np
@@ -13,6 +14,7 @@ import redis
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+from app.utils.upload_validation import validate_audio_upload
 
 logger = logging.getLogger("verivoice.enroll")
 from app.db.crud import create_citizen, create_voice_template, get_citizen_by_mosip_id, get_citizen_by_national_id
@@ -70,16 +72,14 @@ async def enroll(
     # ── Resolve identity verification ────────────────────────────────────
     identity_verified = False
     if mosip_individual_id:
-        # Verify this MOSIP ID was recently validated via e-Signet callback
+        # Atomically consume the one-time verification token (B4 fix)
         redis_key = f"esignet:verified:{mosip_individual_id}"
-        if not _redis_client.get(redis_key):
+        if not _redis_client.getdel(redis_key):
             raise HTTPException(
                 status_code=400,
                 detail="Invalid or expired MOSIP identity session. "
                 "Complete e-Signet verification before enrolling.",
             )
-        # Consume the verification token (one-time use)
-        _redis_client.delete(redis_key)
 
         # Check for duplicate MOSIP ID
         if get_citizen_by_mosip_id(db, mosip_individual_id) is not None:
@@ -117,7 +117,7 @@ async def enroll(
     for i, upload in enumerate(audio_files):
         logger.info("[ENROLL] ── AUDIO %d/%d ── Processing file: %s (%s)",
                      i + 1, len(audio_files), upload.filename, upload.content_type)
-        raw_bytes = await upload.read()
+        raw_bytes = await validate_audio_upload(upload)
 
         # Write to a temp WAV so librosa/preprocessor can load it
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -137,7 +137,6 @@ async def enroll(
             logger.error("[ENROLL] ── AUDIO %d/%d ── FAILED: %s", i + 1, len(audio_files), exc)
             raise
         finally:
-            import os
             os.unlink(tmp_path)
 
     # ── Compute centroid and encrypt ─────────────────────────────────────

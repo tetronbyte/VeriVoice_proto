@@ -32,7 +32,7 @@ _QUESTION_NUMBER_WORDS: dict[str, dict[str, int]] = {
     "sw": {
         "moja": 0, "1": 0, "kwanza": 0, "ya kwanza": 0,
         "mbili": 1, "2": 1, "pili": 1, "ya pili": 1,
-        "tatu": 2, "3": 2, "tatu": 2, "ya tatu": 2,
+        "tatu": 2, "3": 2, "ya tatu": 2,
     },
 }
 

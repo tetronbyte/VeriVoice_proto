@@ -71,12 +71,12 @@ Verify:
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","version":"0.1.0"}
+# {"status":"ok","version":"0.1.0","models":{"ecapa_tdnn":"ready","whisper":"ready","w2v_bert_swahili":"ready"}}
 ```
 
 Interactive API docs: `http://localhost:8000/docs` (Swagger UI).
 
-On startup, all 3 ML models (ECAPA-TDNN, Whisper large-v3, w2v-BERT Swahili) are loaded into memory in a background thread. The `/health` endpoint responds immediately; models are ready by the time the first real request arrives.
+On startup, all 3 ML models (ECAPA-TDNN, Whisper large-v3, w2v-BERT Swahili) are loaded into memory in a background thread. The `/health` endpoint returns `503` with `"status":"warming_up"` until all models are ready, then switches to `200` with `"status":"ok"`.
 
 ---
 
@@ -314,6 +314,7 @@ All settings are loaded from `.env` via Pydantic `BaseSettings`. See `.env.examp
 | `SWAHILI_ASR_MODEL` | `badrex/w2v-bert-2.0-swahili-asr` | Swahili ASR model |
 | `MATCH_THRESHOLD` | `0.45` | Voice biometric cosine similarity threshold |
 | `TRANSCRIPT_MATCH_THRESHOLD` | `0.75` | Phrase transcript word-similarity threshold |
+| `CONSENT_TOKEN_TTL_HOURS` | `24` | Consent token expiry (hours from issue) |
 
 ### Twilio IVR
 
@@ -465,7 +466,7 @@ VeriVoice_proto/
 ├── streamlit_app/app.py     # Streamlit demo UI (5 pages incl. MOSIP verification)
 ├── twilio_integration/      # Twilio IVR webhooks, call flow, service catalog
 │   ├── webhook_handler.py   # All IVR webhook endpoints
-│   ├── ivr_flow.py          # IVR state enum, enrollment phrase picker
+│   ├── ivr_flow.py          # Enrollment phrase picker (unique per session)
 │   └── service_catalog.py   # 5-service catalog (EN+SW questions, read-back templates)
 ├── MOSIP_eSignet/           # MOSIP e-Signet tooling (Java, external)
 │   ├── collab-mock-mds-reg/ # Mock MDS for Registration
@@ -524,7 +525,9 @@ pytest tests/test_esignet_e2e.py -v -s  # Full MOSIP e-Signet + VeriVoice e2e fl
 - **Twilio request validation** — webhook endpoints verify `X-Twilio-Signature` when auth token is configured
 - **MOSIP e-Signet OIDC** — JWT validation (PS256 signature via JWKS, expiry, audience, issuer, nonce)
 - **OIDC replay protection** — state/nonce stored in Redis with 5-min TTL, consumed atomically on callback
-- **Identity-verified enrollment** — MOSIP verification token single-use (consumed on enrollment)
+- **Identity-verified enrollment** — MOSIP verification token single-use (consumed atomically via `GETDEL`)
+- **Consent token expiry** — tokens expire after configurable TTL (default 24h); checked on every service access
+- **Audio upload validation** — file size (max 10 MB) and format checks before processing
 
 ---
 

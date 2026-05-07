@@ -12,8 +12,11 @@ import torchaudio
 import huggingface_hub
 
 # ── Compatibility patches for speechbrain 1.0 + newer deps ──────────────────
+# These patches are needed for the pinned version ranges in requirements.txt:
+#   speechbrain>=1.0,<1.1  |  torchaudio>=2.0,<2.7  |  huggingface_hub>=1.3,<1.8
+# Review and remove when upgrading to newer major versions.
 
-# Patch 1: torchaudio >= 2.11 removed list_audio_backends
+# Patch 1: torchaudio >= 2.11 removed list_audio_backends (speechbrain expects it)
 if not hasattr(torchaudio, "list_audio_backends"):
     torchaudio.list_audio_backends = lambda: ["soundfile"]
 

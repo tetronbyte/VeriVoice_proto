@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.utils.upload_validation import validate_audio_upload
 
 logger = logging.getLogger("verivoice.auth")
 from app.db.crud import (
@@ -91,7 +92,7 @@ async def authenticate(
     logger.info("[AUTH] ── Voice template loaded: %s", template.template_id)
 
     # ── Read and preprocess audio ────────────────────────────────────────
-    raw_bytes = await audio_file.read()
+    raw_bytes = await validate_audio_upload(audio_file)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(raw_bytes)
         tmp_path = tmp.name

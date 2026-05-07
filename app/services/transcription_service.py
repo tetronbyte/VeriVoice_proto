@@ -5,7 +5,10 @@ for Swahili.  The Swahili model outperforms Whisper large-v3 on Swahili
 speech and is selected automatically when language="sw".
 """
 
+import logging
 import threading
+
+logger = logging.getLogger("verivoice.transcription")
 
 import librosa
 import numpy as np
@@ -66,10 +69,9 @@ class TranscriptionService:
             self._sw_model = Wav2Vec2BertForCTC.from_pretrained(self._sw_model_name).to(device)
             return True
         except Exception as exc:
-            print(
-                f"[TranscriptionService] Swahili model '{self._sw_model_name}' unavailable "
-                f"({exc.__class__.__name__}: {exc}); falling back to Whisper for Swahili.",
-                flush=True,
+            logger.warning(
+                "Swahili model '%s' unavailable (%s: %s); falling back to Whisper for Swahili.",
+                self._sw_model_name, exc.__class__.__name__, exc,
             )
             self._sw_load_failed = True
             self._sw_model = None
@@ -117,14 +119,18 @@ class TranscriptionService:
                       everything else (including None) routes to Whisper.
 
         Returns:
-            Transcribed text string.
+            Transcribed text string, or empty string if transcription fails.
         """
-        audio_data = self._load_audio(audio)
+        try:
+            audio_data = self._load_audio(audio)
 
-        if language == "sw":
-            return self._transcribe_swahili(audio_data)
+            if language == "sw":
+                return self._transcribe_swahili(audio_data)
 
-        return self._transcribe_whisper(audio_data, language)
+            return self._transcribe_whisper(audio_data, language)
+        except Exception as exc:
+            logger.error("Transcription failed (lang=%s): %s", language, exc)
+            return ""
 
     @classmethod
     def reset(cls) -> None:

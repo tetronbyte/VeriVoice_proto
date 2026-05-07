@@ -1,9 +1,10 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, LargeBinary, String
 from sqlalchemy.orm import relationship
 
+from app.config import settings
 from app.db.database import Base
 
 
@@ -16,6 +17,11 @@ class ConsentToken(Base):
     data_scope = Column(String, nullable=False)
     digital_signature = Column(LargeBinary, nullable=False)
     issued_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at = Column(
+        DateTime,
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc) + timedelta(hours=settings.CONSENT_TOKEN_TTL_HOURS),
+    )
     is_revoked = Column(Boolean, nullable=False, default=False)
 
     citizen = relationship("Citizen", back_populates="consent_tokens")

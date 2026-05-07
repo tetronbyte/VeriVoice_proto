@@ -4,11 +4,7 @@ import numpy as np
 from scipy.signal import butter, filtfilt
 
 from app.config import settings
-from app.utils.audio_utils import load_audio, spectral_subtract, vad_trim
-
-
-class SilentAudioError(Exception):
-    """Raised when the audio peak amplitude is below the rejection threshold."""
+from app.utils.audio_utils import SilentAudioError, load_audio, spectral_subtract, vad_trim
 
 
 class AudioPreprocessor:

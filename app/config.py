@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     # Enrollment
     ENROLLMENT_PHRASES: int = 5
 
+    # Consent
+    CONSENT_TOKEN_TTL_HOURS: int = 24
+
     # MOSIP e-Signet (OIDC)
     ESIGNET_BASE_URL: str = ""
     ESIGNET_UI_URL: str = ""
