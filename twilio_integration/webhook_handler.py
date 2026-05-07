@@ -164,6 +164,17 @@ async def _update_call_twiml(call_sid: str, twiml: str) -> None:
 
 
 
+def _token_expired(token) -> bool:
+    """Check if a consent token has expired (handles naive/aware datetimes)."""
+    if not token.expires_at:
+        return False
+    now = datetime.now(timezone.utc)
+    exp = token.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return now > exp
+
+
 def _twiml_response(response: VoiceResponse) -> Response:
     """Return a TwiML XML response with correct content type."""
     return Response(content=str(response), media_type="application/xml")
@@ -1172,7 +1183,7 @@ async def service_menu(
     db = SessionLocal()
     try:
         token = get_consent_token(db, consent_token_id) if consent_token_id else None
-        if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id) or (token.expires_at and datetime.now(timezone.utc) > token.expires_at):
+        if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id) or _token_expired(token):
             logger.error("[IVR SERVICE MENU] invalid/expired consent token %s", consent_token_id)
             _say_or_play(response,
                 _tr("Consent is not valid. Goodbye.", "Idhini si halali. Kwaheri.", lang), lang)
@@ -1265,7 +1276,7 @@ async def service_prompt(
     db = SessionLocal()
     try:
         token = get_consent_token(db, consent_token_id) if consent_token_id else None
-        if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id) or (token.expires_at and datetime.now(timezone.utc) > token.expires_at):
+        if token is None or token.is_revoked or str(token.citizen_id) != str(citizen_id) or _token_expired(token):
             logger.error("[IVR SERVICE] invalid/expired consent token %s", consent_token_id)
             _say_or_play(response,
                 _tr("Consent is not valid. Goodbye.", "Idhini si halali. Kwaheri.", lang), lang)
